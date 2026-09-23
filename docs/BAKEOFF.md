@@ -36,6 +36,40 @@ So the concept is sound and Laya is a good base to fine-tune from a small datase
 framing does not hold up: zero-shot it loses to a free, widely used NLI model, and once you have ~1,000 labels a
 conventional fine-tune does better.
 
+## Which should you use?
+
+A Laya fine-tune, or a traditional fine-tune (a ModernBERT-style encoder with per-question classification heads)?
+
+**Laya is the better choice when:**
+
+- **You have little data** (a few hundred labelled cases or fewer). It led by 5–9 points at 150 cases.
+- **You want honest probabilities with no calibration step** (raw ECE 0.034).
+- **Your questions change.** You can reword questions or add options without re-architecting. Accuracy on new
+  questions stays weak until you retrain, but the pipeline doesn't change.
+- **You want what this repo already provides:** serving, CUDA graphs, fine-tuning, evaluation, the API and the UI
+  are all built around Laya.
+
+**A traditional fine-tune is the better choice when:**
+
+- **You have ~1,000+ labelled cases.** It was 5 points more accurate and won on every question type, especially the
+  ordinal 0–4 scales.
+- **Throughput and training cost matter.** It is 1.5× faster to serve and 5.6× faster to train, because it encodes
+  each input once rather than once per question.
+- **You want standard, well-supported tooling:** a classification head and ordinary Hugging Face training, with no
+  dependency on a small, new SDK.
+
+**Its costs:**
+
+- It needs a calibration step for honest probabilities (raw ECE 0.154 before it).
+- Changing a question means retraining.
+- This repo does not serve it: `bakeoff.py heads` trains and scores it for comparison, but does not save a model the
+  API can load.
+
+**Recommendation.** Start with a Laya fine-tune while you collect your first few hundred labels: it gets you to
+something useful fastest, and it is already wired into this stack. Once you have ~1,000 labels and a stable schema,
+train the traditional model on the same data, compare both on the same held-out test set (`bakeoff.py heads`
+against `bakeoff.py laya`, or `make evaluate`), and switch if it wins. On this benchmark it did.
+
 ## Part 1: typed-decisions (multi-question workflows)
 
 **Task.** [LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions): 4 workflows, 5
