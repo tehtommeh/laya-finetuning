@@ -6,6 +6,7 @@
     python bakeoff.py heads --name heads-full [--limit 150]          # ModernBERT-large + per-question heads
     python bakeoff.py nli-finetune --name nli-ft-full [--limit 150]   # fine-tune a zero-shot NLI model
     python bakeoff.py table                                            # the comparison table
+    python bakeoff.py bootstrap                                        # 95% CIs and paired differences
 
 Everything that could favour one method is shared:
   * splits: typed-decisions train split into 1,075 train / 125 calibration by id hash (seed 0,
@@ -424,6 +425,34 @@ def recalibrate(_a):
         print("recalibrated %s" % r["name"])
 
 
+def bootstrap(_a, draws=2000):
+    """Accuracy 95% CIs and paired differences, resampling test *cases* (a case's answers stay
+    together). Covers test-set sampling only, not training-seed variation."""
+    _, _, test = load()
+    ans = answers(test)
+    cases = sorted({a["case"] for a in ans})
+    idx = {c: [i for i, a in enumerate(ans) if a["case"] == c] for c in cases}
+    rng = np.random.default_rng(0)
+    samples = [np.concatenate([idx[c] for c in rng.choice(cases, len(cases))]) for _ in range(draws)]
+    runs = {}
+    for p in sorted(glob.glob(os.path.join(OUT, "*.json"))):
+        r = json.load(open(p))
+        if "test_logprobs" in r:
+            runs[r["name"]] = np.array([int(np.argmax(lp)) == a["label"] for lp, a in zip(r["test_logprobs"], ans)], float)
+    print("| method | accuracy | 95% CI |\n|---|---|---|")
+    for n, c in runs.items():
+        s = np.array([c[d].mean() for d in samples])
+        print("| %s | %.3f | %.3f-%.3f |" % (n, c.mean(), np.percentile(s, 2.5), np.percentile(s, 97.5)))
+    pairs = [("deberta-v3-large-zs", "laya-zeroshot"), ("laya-ft-150", "nli-modernbert-ft-150"),
+             ("laya-ft-150", "heads-ft-150"), ("heads-ft-1075", "laya-ft-1075"), ("laya-ft-1075", "nli-modernbert-ft-1075")]
+    print("\n| A - B | difference | 95% CI | share of draws A <= B |\n|---|---|---|---|")
+    for a, b in pairs:
+        if a in runs and b in runs:
+            d = np.array([runs[a][x].mean() - runs[b][x].mean() for x in samples])
+            print("| %s - %s | %+.3f | %+.3f to %+.3f | %.3f |" % (a, b, runs[a].mean() - runs[b].mean(),
+                                                                   np.percentile(d, 2.5), np.percentile(d, 97.5), (d <= 0).mean()))
+
+
 def table(_a):
     rows = []
     for p in sorted(glob.glob(os.path.join(OUT, "*.json"))):
@@ -444,11 +473,12 @@ def table(_a):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("method", choices=["laya", "nli-zeroshot", "gliclass", "heads", "nli-finetune", "table", "recalibrate"])
+    ap.add_argument("method", choices=["laya", "nli-zeroshot", "gliclass", "heads", "nli-finetune", "table", "recalibrate",
+                                       "bootstrap"])
     ap.add_argument("--name")
     ap.add_argument("--model", help="laya checkpoint dir")
     ap.add_argument("--hf", help="Hugging Face model id")
     ap.add_argument("--limit", type=int, help="train on the nested N-case subset (as train.py --limit)")
     a = ap.parse_args()
     {"laya": run_laya, "nli-zeroshot": run_nli_zeroshot, "gliclass": run_gliclass, "heads": run_heads,
-     "nli-finetune": run_nli_finetune, "table": table, "recalibrate": recalibrate}[a.method](a)
+     "nli-finetune": run_nli_finetune, "table": table, "recalibrate": recalibrate, "bootstrap": bootstrap}[a.method](a)

@@ -54,6 +54,7 @@ This repo does two things:
 | `docs/DATA_PREP.md` | turning exports, votes and LLM-teacher labels into training JSONL; splits; tested recipes |
 | `docs/PERFORMANCE.md` | every serving optimisation, the measurements behind it, and what each gained |
 | `docs/BAKEOFF.md` | Laya vs popular zero-shot, fine-tuned and specialist models: does it live up to the hype? |
+| `docs/BAKEOFF_NEXT_STEPS.md` | planned tests to make the bake-off fully fair (tuning budget, seeds, fine-tuned competitors) |
 
 ## Start / stop
 

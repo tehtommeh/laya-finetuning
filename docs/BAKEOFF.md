@@ -21,7 +21,8 @@ fine-tune).
   0.360, below always answering the most common label (0.452). A popular zero-shot NLI model, DeBERTa-v3-large,
   scores 0.539 with no training at all.
 - **Laya learns fast from little data.** With 150 labelled cases it beats every other approach given the same data
-  (0.591, against 0.545 and 0.506).
+  (0.591, against 0.545 and 0.506). This is the least robust finding, because the competitors ran untuned defaults
+  while Laya's recipe was built for this benchmark (see [Fairness review](#fairness-review)).
 - **With ~1,000 cases, a plain fine-tune of the same encoder wins.** ModernBERT-large with ordinary per-question
   classification heads scores 0.781 against Laya's 0.733. It is also better on every question type, 1.5× faster to
   serve, and 5.6× faster to train. Laya's typed-question machinery helps when data is scarce, and costs accuracy
@@ -30,7 +31,11 @@ fine-tune).
   post-calibration (raw ECE 0.034). After everyone gets the same temperature fit, the gap closes.
 - **Against specialists it is mixed.** Laya matches or beats the toxicity and prompt-injection specialists, and
   loses to the sentiment specialist on its home benchmark. With 450 in-domain examples it becomes excellent at
-  prompt injection (0.948 accuracy). Specialists are 2–3× faster.
+  prompt injection (0.948 accuracy). But no competitor was fine-tuned on those examples, so that shows the value of
+  in-domain data, not that Laya is a better method. Specialists are 2–3× faster.
+
+Every headline difference in Part 1 is well outside test-set noise (paired bootstrap below). Planned tests to settle
+the open points are in [BAKEOFF_NEXT_STEPS.md](BAKEOFF_NEXT_STEPS.md).
 
 So the concept is sound and Laya is a good base to fine-tune from a small dataset. The "general decision engine"
 framing does not hold up: zero-shot it loses to a free, widely used NLI model, and once you have ~1,000 labels a
@@ -42,7 +47,8 @@ A Laya fine-tune, or a traditional fine-tune (a ModernBERT-style encoder with pe
 
 **Laya is the better choice when:**
 
-- **You have little data** (a few hundred labelled cases or fewer). It led by 5–9 points at 150 cases.
+- **You have little data** (a few hundred labelled cases or fewer). It led by 5–9 points at 150 cases, against
+  untuned competitors; the next steps test whether that holds with equal tuning.
 - **You want honest probabilities with no calibration step** (raw ECE 0.034).
 - **Your questions change.** You can reword questions or add options without re-architecting. Accuracy on new
   questions stays weak until you retrain, but the pipeline doesn't change.
@@ -90,8 +96,9 @@ calibration. The majority-label baseline (always answer the most common training
 
 **Shared across all methods.** The same splits and soft labels. The same hard-label temperature calibration on the
 125-case calibration set, over a wide range [0.05, 50]. The same metrics code (`evaluate.py`). Latency is model
-time per test case (all its questions), one case at a time, bf16. No method's hyper-parameters were tuned, Laya's
-included.
+time per test case (all its questions), one case at a time, bf16. No hyper-parameters were tuned here. Laya's
+recipe is its authors' own, designed for this benchmark; the competitors use generic defaults (see
+[Fairness review](#fairness-review)).
 
 **Results** (calibrated; accuracy never depends on calibration):
 
@@ -199,12 +206,83 @@ comments (87 toxic).
 - **`meta-llama/Llama-Prompt-Guard-2-86M` was not tested:** it is gated, and this account has not been granted
   access.
 
-## Limitations
+## Fairness review
 
-- **One run per configuration.** Laya's earlier seed repeats varied by under 1 point; the others were not repeated.
-- **Untuned defaults for everyone.** The NLI fine-tune ran 2 epochs (it costs one pass per option), and more might
-  help it. Laya's own recipe is its authors'.
-- **Test-set size.** Specialist test sets are samples (1,000 rows; 116 for prompt injection), so differences of a
-  couple of points there are within noise.
-- **One domain.** typed-decisions is one benchmark, with synthetic teacher labels. Results on your own schema can
-  differ, and `make evaluate` against a majority baseline is the check that matters.
+A review, after the runs, of whether the methodology was fair to every model. In short: Part 1 is mostly fair and
+tilted slightly *toward* Laya. Part 2's fine-tuned rows are not a fair comparison between methods.
+
+### Is it noise?
+
+`python bakeoff.py bootstrap` resamples the 400 test cases 2,000 times, keeping each case's answers together, and
+pairs the models on the same resamples:
+
+| comparison | difference | 95% CI | share of draws where it reverses |
+|---|---|---|---|
+| DeBERTa zero-shot − Laya zero-shot | +17.9 pts | +14.7 to +21.1 | 0.000 |
+| Laya − NLI fine-tune, 150 cases | +4.6 pts | +2.3 to +7.0 | 0.001 |
+| Laya − ModernBERT heads, 150 cases | +8.5 pts | +5.8 to +11.0 | 0.000 |
+| ModernBERT heads − Laya, 1,075 cases | +4.9 pts | +2.8 to +6.9 | 0.000 |
+| Laya − NLI fine-tune, 1,075 cases | +7.7 pts | +5.5 to +10.0 | 0.000 |
+
+Individual accuracies carry about ±2.3 points (95%). This covers test-set sampling only: each model was trained
+once. Laya's earlier seed repeats varied by under 1 point; the competitors' seed variation was not measured.
+
+### What was fair
+
+- identical splits, soft labels and nested training subsets for every model;
+- one test set, one metric implementation, one calibration procedure (hard-label temperature on the calibration
+  split, same range for all);
+- no hyper-parameters chosen on the test set, for any model.
+
+### Biases in Laya's favour
+
+- **Laya's recipe was built for this benchmark.** The official notebook fine-tunes on typed-decisions. The
+  competitors got generic defaults, untuned.
+- **Small data is where untuned defaults hurt most.** The heads model starts with randomly initialised output
+  layers and got 76 training steps at 150 cases. Tripling the epochs gave Laya +3 points at 150 cases, and would
+  likely help the heads model more. "Laya is best at 150 cases" may not survive equal tuning effort.
+- **The NLI fine-tune ran 2 epochs (the others 4),** because it costs one pass per option. Its results are
+  probably understated.
+- **Zero-shot NLI models got one untuned hypothesis template, and DeBERTa's 512-token limit cut off long states.**
+  Laya zero-shot used its native question format. DeBERTa still won by 18 points, so that conclusion stands.
+
+### Biases against Laya
+
+- **Latency was measured eager for every model.** Laya's served path with CUDA graphs (~7–15 ms per request) would
+  remove the heads model's speed advantage for single requests. "1.5× faster to serve" compares eager to eager.
+- **The benchmark suits fixed per-question heads:** every test question also appears in training. Where questions
+  change, Laya's request-time flexibility counts for more than this benchmark can show.
+
+### Affecting every model
+
+- "Correct" means agreeing with the teacher LLM that produced the gold labels, not ground truth: the same criticism
+  aimed at Jev's evaluations. It is also one synthetic benchmark.
+
+### Part 2 (specialists)
+
+1. **Only Laya was fine-tuned on in-domain data.** A fair comparison would fine-tune a competitor (ModernBERT heads,
+   and the specialists themselves) on the same 450 examples.
+2. **The calibration numbers are not comparable.** The Laya fine-tunes had a held-out calibration step; the other
+   models were scored raw. On toxicity, Laya also trained on the rater fractions that Brier is scored against.
+3. **Uneven prompting.** Laya got detailed instructions and definitions; the zero-shot NLI model got one-line
+   hypotheses ("This text is toxic.").
+4. **Granite Guardian got two tries** (`harm`, then `profanity` after seeing the first result); every other model
+   got one.
+5. **Small samples.** 116 prompt-injection test cases give intervals of roughly ±8 points.
+6. **The prompt-injection specialist was genuinely out of domain.** Its model card lists seven training datasets,
+   none of them deepset's, which partly explains its weak showing. Laya's own training data is not published.
+
+### What survives
+
+| claim | status |
+|---|---|
+| Laya is weak zero-shot on a new schema (loses to DeBERTa NLI and the majority baseline) | **robust** |
+| A plain fine-tune of the same encoder beats Laya at ~1,000 cases | **robust**: it held despite the tilt toward Laya |
+| Laya is the best-calibrated model out of the box | **robust** |
+| Laya is the best approach with ~150 cases | plausible, not established (competitors untuned) |
+| Laya matches the toxicity and prompt-injection specialists zero-shot | plausible (small samples, unknown training data) |
+| Laya fine-tuned beats specialists | **not supported** as a method comparison (only Laya saw in-domain data) |
+
+Other limitations: specialist test sets are samples (1,000 rows; 116 for prompt injection), so differences of a
+couple of points there are within noise, and results on your own schema can differ. `make evaluate` against a
+majority baseline is the check that matters.
