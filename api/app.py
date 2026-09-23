@@ -62,6 +62,10 @@ BATCH_MAX_STATES = int(os.environ.get("BATCH_MAX_STATES", "1024"))
 # sequences requests get 503 instead of piling up; a request waits at most REQUEST_TIMEOUT_S.
 QUEUE_MAX_SEQUENCES = int(os.environ.get("QUEUE_MAX_SEQUENCES", "50000"))
 REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "120"))
+# CUDA graphs for small (dispatch-bound) passes; see batching.GraphRunner. 0 disables them,
+# e.g. if a driver misbehaves. Passes up to GRAPH_MAX_TOKENS padded tokens are replayed from graphs.
+CUDA_GRAPHS = os.environ.get("CUDA_GRAPHS", "1") not in ("0", "false", "no", "")
+GRAPH_MAX_TOKENS = int(os.environ.get("GRAPH_MAX_TOKENS", "2048"))
 INLINE_ENCODE_STATES = 4   # encode this many states on the event loop; larger requests use the thread pool
 
 # checkpoint name -> subfolder inside the bundle repo (None = repo root)
@@ -139,6 +143,7 @@ def load_models():
             agent.system_one("warm up", WARMUP_QUESTIONS)
             STATE["checkpoints"][n] = _describe(agent, models[n][0] if not models[n][1] else os.path.join(*models[n]),
                                                 t0, t1, "shipped")
+            STATE["checkpoints"][n]["cuda_graphs"] = _capture_graphs(n, agent)
             log.info("checkpoint %s ready: %s", n, STATE["checkpoints"][n])
         _load_finetuned()
     STATE["warnings"] = sorted({str(w.message) for w in caught if "laya" in str(w.message).lower()}) + STATE["warnings"]
@@ -151,6 +156,23 @@ def load_models():
             log.error("checkpoints fell back to CPU: %s", off_gpu)
     STATE["ready"] = True
     log.info("all checkpoints ready in %ss", STATE["load_seconds"])
+
+
+def _capture_graphs(name, agent) -> Optional[dict]:
+    """Capture CUDA graphs for this checkpoint's small passes (after precast and warm-up)."""
+    from batching import GraphRunner
+    if not CUDA_GRAPHS or agent.device.type != "cuda":
+        return None
+    torch.cuda.synchronize()
+    t0, free0 = time.time(), torch.cuda.mem_get_info()[0]
+    runner = GraphRunner(agent, max_tokens=GRAPH_MAX_TOKENS)
+    n = runner.capture()
+    agent._graphs = runner
+    info = {"graphs": n, "capture_seconds": round(time.time() - t0, 1),
+            "memory_gb": round((free0 - torch.cuda.mem_get_info()[0]) / 1e9, 2), "max_tokens": GRAPH_MAX_TOKENS}
+    log.info("checkpoint %s: captured %d CUDA graphs in %.1fs (GPU memory %+.2f GB)", name, n,
+             info["capture_seconds"], info["memory_gb"])
+    return info
 
 
 def _precast(name, agent):
@@ -210,6 +232,7 @@ def _load_finetuned():
             log.exception("fine-tuned %s failed to load", name)
             continue
         d = _describe(agent, src, t0, t1, "fine-tuned")
+        d["cuda_graphs"] = _capture_graphs(name, agent)
         summ = _read_json(os.path.join(src, "training_summary.json")) or {}
         ev = _read_json(os.path.join(src, "eval.json")) or {}
         d["training"] = {k: summ.get(k) for k in ("base", "finished_at", "gpu", "timing", "memory")} | {
@@ -276,6 +299,15 @@ def info():
             "compute_capability": ".".join(map(str, torch.cuda.get_device_capability())),
         }
     cks = STATE["checkpoints"]
+    agents = dict(STATE.get("custom", {}))
+    if STATE.get("router"):
+        agents.update({n: a for n, a in STATE["router"]._agents.items()})
+    for n, a in agents.items():
+        g = getattr(a, "_graphs", None)
+        if g is not None and n in cks and cks[n].get("cuda_graphs"):
+            cks[n]["cuda_graphs"].update(replays=g.replays, eager_passes=g.eager_passes,
+                                         eager_floor_ms=round(g.eager_floor_ms, 2),
+                                         eager_ms_per_1k_tokens=round(g.eager_ms_per_token * 1000, 2))
     import laya
     import transformers
     return {

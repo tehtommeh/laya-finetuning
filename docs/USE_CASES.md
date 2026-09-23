@@ -155,7 +155,8 @@ work best.
 
 ## Combinations: several small questions, one pass
 
-Five questions cost barely more than one (23 ms for 1, 24 ms for 5, 35 ms for 10 on an RTX 3090), so decompose
+Several questions cost little more than one (6 ms for 1, 15 ms for 3, 24 ms for 5, 36 ms for 10 on a ~500-token
+state, RTX 3090), so decompose
 the decision instead of cramming it into one question. Each piece stays simple and learnable, you can inspect it
 on its own, and changing policy means changing code rather than relabelling data.
 
@@ -278,7 +279,7 @@ human. Calibrated probabilities make the split trustworthy, and you choose the t
 can accept. Typically most traffic clears the gate, so the expensive path handles only the ambiguous cases.
 
 **Pre-filter for expensive calls.** A `noul` ("is this worth processing?" or "is this in scope?") in front of a
-large-model step. At ~22 ms, the check is nearly free compared with what it saves.
+large-model step. At ~7 ms for a short input, the check is nearly free compared with what it saves.
 
 **Decide, then explain.** Laya makes the decision, and an LLM writes the customer-facing explanation or reply, with
 the decision given as input. The decision stays consistent and auditable, and the LLM does what it's good at.

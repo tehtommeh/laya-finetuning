@@ -29,8 +29,9 @@ test:      ## Run the endpoint smoke tests
 test-batch:  ## Check /v1/decide/batch matches per-state /v1/decide, and time both
 	python3 scripts/test_batch_equivalence.py
 
-test-coalescing:  ## Scheduler unit tests + live concurrent leak test against the SDK (~3 min)
+test-coalescing:  ## Scheduler + CUDA-graph tests, then a live concurrent leak test against the SDK (~5 min)
 	docker compose exec -T api python - < scripts/test_scheduler.py
+	docker compose exec -T api python - < scripts/test_cuda_graphs.py
 	docker compose exec -T api python - < scripts/test_coalescing.py
 
 load-test:  ## Throughput and latency under 1-128 concurrent clients

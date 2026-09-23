@@ -200,8 +200,205 @@ def precast_weights(model, dtype) -> int:
     return saved
 
 
+# --------------------------------------------------------------------------- CUDA graphs
+GRAPH_ROWS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+GRAPH_LENS = (32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
+GRAPH_MAX_OPTIONS = 16      # passes with more options per question run eagerly
+_GRAPH_POOL = None          # one memory pool for every checkpoint's graphs (see GraphRunner)
+_WARMUP_STREAM = None       # one side stream for all capture warm-ups: cuBLAS keeps a workspace per stream
+
+
+def _warmup_stream(device):
+    global _WARMUP_STREAM
+    if _WARMUP_STREAM is None:
+        _WARMUP_STREAM = torch.cuda.Stream(device)
+    return _WARMUP_STREAM
+
+
+def _shared_graph_pool():
+    global _GRAPH_POOL
+    if _GRAPH_POOL is None:
+        _GRAPH_POOL = torch.cuda.graph_pool_handle()
+    return _GRAPH_POOL
+
+
+class GraphRunner:
+    """CUDA graphs for small forward passes of one checkpoint.
+
+    A small pass is dispatch-bound: ~950 kernel launches from Python cost ~20 ms whatever
+    the batch size, while the GPU work for a few rows takes a few ms. A CUDA graph records
+    the launches once and replays them with one call (1-request pass: 20.8 -> 6.7 ms).
+
+    Graphs need fixed shapes, so passes are padded to the smallest captured bucket of
+    (rows, length); extra rows are dummies whose outputs are dropped. Padding costs GPU work:
+    once a pass is big enough to be GPU-bound, padding it up to a bucket is slower than
+    running it eagerly (measured: 5 questions on a 250-token state went 24 -> 45 ms with a
+    fixed 2,048-token cap). So each pass is routed by measured cost: at capture time every
+    bucket's replay is timed, and the eager path's fixed dispatch floor and per-token rate
+    are measured; a pass uses a graph only if its bucket's time beats the eager estimate for
+    its real (unpadded) shape. This calibrates itself to the GPU and the checkpoint.
+
+    Replaying at a bucket shape matches the eager model on the same padded tensors: bit for
+    bit in ~99.9% of cases, and otherwise by one or two bf16 rounding steps, because capture
+    makes the encoder's GPU libraries pick slightly different kernels (deterministic per input;
+    scripts/test_cuda_graphs.py). Padding to a bucket rather than to the longest row shifts
+    bf16 results within the noise any change of batch shape causes (docs/PERFORMANCE.md).
+
+    Only buckets that can beat eager are captured: the eager floor and per-token rate are
+    measured first, and a bucket is captured if its GPU work (tokens x rate) is below the
+    floor, i.e. while the pass is still dispatch-bound. `max_tokens` is a hard cap on top.
+
+    All graphs, of every checkpoint, share one memory pool (per-checkpoint pools cost 1.9 GB
+    for four checkpoints). That is safe here because replays are serialised on the single GPU
+    worker thread and every output is copied to the CPU immediately, before any other graph
+    runs.
+    """
+
+    def __init__(self, agent, max_tokens: int = 2048):
+        self.agent = agent
+        self.max_tokens = max_tokens
+        self.max_len = agent.cfg.get("max_len", 512)
+        self.pool = _shared_graph_pool()
+        self.graphs: dict[tuple[int, int], tuple] = {}
+        self.lens = [length for length in GRAPH_LENS if length <= self.max_len]
+        self.replays = 0
+        self.eager_passes = 0
+        self.graph_ms: dict[tuple[int, int], float] = {}   # measured replay time per bucket
+        self.eager_floor_ms = 0.0                           # eager pass cost that does not scale with size
+        self.eager_ms_per_token = 0.0                        # eager cost per padded token once GPU-bound
+        self.capture_limit_tokens = 0
+
+    @torch.no_grad()
+    def _fwd(self, inputs):
+        with torch.autocast(device_type="cuda", dtype=self.agent.dtype, cache_enabled=False):
+            logits, act = self.agent.model(*inputs)
+        return logits.float(), torch.softmax(act.float(), -1)
+
+    def _dummy_inputs(self, rows: int, length: int) -> list[np.ndarray]:
+        """Host-side buffers of a bucket shape, pre-filled as valid dummy rows: one [CLS]
+        token attended, one option marker. Real rows overwrite their slice."""
+        tok = self.agent.tok
+        ids = np.full((rows, length), tok.pad_token_id, dtype=np.int64)
+        ids[:, 0] = tok.cls_token_id
+        att = np.zeros((rows, length), dtype=np.int64)
+        att[:, 0] = 1
+        mpos = np.zeros((rows, GRAPH_MAX_OPTIONS), dtype=np.int64)
+        mmask = np.zeros((rows, GRAPH_MAX_OPTIONS), dtype=bool)
+        mmask[:, 0] = True
+        return [ids, att, mpos, mmask, np.zeros(rows, dtype=np.int64)]
+
+    def capture(self) -> int:
+        """Measure eager, then capture every bucket that can beat it. Returns the number captured."""
+        dev = self.agent.device
+        self._calibrate_eager()
+        worthwhile = self.eager_floor_ms / max(self.eager_ms_per_token, 1e-9)   # tokens of GPU work = one dispatch floor
+        self.capture_limit_tokens = int(min(self.max_tokens, worthwhile))
+        for length in self.lens:
+            for rows in GRAPH_ROWS:
+                if rows * length > self.capture_limit_tokens and not (rows == 1 and length == self.lens[0]):
+                    continue
+                static = [torch.from_numpy(a).to(dev) for a in self._dummy_inputs(rows, length)]
+                side = _warmup_stream(dev)
+                side.wait_stream(torch.cuda.current_stream(dev))
+                with torch.cuda.stream(side):                       # warm up off the capture stream
+                    for _ in range(3):
+                        self._fwd(static)
+                torch.cuda.current_stream(dev).wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self.pool):
+                    out = self._fwd(static)
+                self.graphs[(rows, length)] = (graph, static, out)
+        torch.cuda.synchronize(dev)
+        for key, (graph, _, _) in self.graphs.items():
+            self.graph_ms[key] = self._time_ms(graph.replay)
+        return len(self.graphs)
+
+    @staticmethod
+    def _time_ms(fn, reps: int = 7) -> float:
+        fn()
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(reps):
+            t = time.perf_counter()
+            fn()
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - t) * 1000)
+        return sorted(times)[len(times) // 2]
+
+    def _calibrate_eager(self):
+        """The eager path's floor (a tiny pass) and per-token rate (a large, GPU-bound pass)."""
+        dev = self.agent.device
+        tiny = [torch.from_numpy(a).to(dev) for a in self._dummy_inputs(1, self.lens[0])]
+        big_rows, big_len = 32, min(self.max_len, 512)
+        big = [torch.from_numpy(a).to(dev) for a in self._dummy_inputs(big_rows, big_len)]
+        big[1].fill_(1)   # attend to every position, like a full batch
+        self.eager_floor_ms = self._time_ms(lambda: self._fwd(tiny))
+        self.eager_ms_per_token = self._time_ms(lambda: self._fwd(big), reps=3) / (big_rows * big_len)
+
+    def eager_estimate_ms(self, n_rows: int, width: int) -> float:
+        return max(self.eager_floor_ms, n_rows * width * self.eager_ms_per_token)
+
+    def bucket(self, n_rows: int, width: int, kmax: int) -> Optional[tuple[int, int]]:
+        """The fastest captured bucket that fits, or None if none fits."""
+        if kmax > GRAPH_MAX_OPTIONS:
+            return None
+        fits = [k for k in self.graphs if k[0] >= n_rows and k[1] >= width]
+        if not fits:
+            return None
+        return min(fits, key=lambda k: self.graph_ms.get(k, float(k[0] * k[1])))
+
+    def choose(self, n_rows: int, width: int, kmax: int) -> Optional[tuple[int, int]]:
+        """Bucket to replay for this pass, or None to run it eagerly (cheaper by measurement)."""
+        key = self.bucket(n_rows, width, kmax)
+        if key is None or self.graph_ms.get(key, 0.0) >= self.eager_estimate_ms(n_rows, width):
+            return None
+        return key
+
+    def pad_to(self, items: list[dict], key: tuple[int, int]) -> list[np.ndarray]:
+        rows, length = key
+        buf = self._dummy_inputs(rows, length)
+        ids, att, mpos, mmask, qtype = buf
+        for i, it in enumerate(items):
+            n, k = len(it["ids"]), len(it["markers"])
+            ids[i, :] = self.agent.tok.pad_token_id
+            ids[i, :n] = it["ids"]
+            att[i, :] = 0
+            att[i, :n] = 1
+            mpos[i, :] = 0
+            mpos[i, :k] = it["markers"]
+            mmask[i, :] = False
+            mmask[i, :k] = True
+            qtype[i] = it["qtype"]
+        return buf
+
+    def run(self, items: list[dict]):
+        """(logits, act) as numpy for these rows, or None if no captured bucket fits."""
+        width = max(len(it["ids"]) for it in items)
+        kmax = max(len(it["markers"]) for it in items)
+        key = self.choose(len(items), width, kmax)
+        if key is None:
+            self.eager_passes += 1
+            return None
+        return self.run_bucket(items, key)
+
+    def run_bucket(self, items: list[dict], key: tuple[int, int]):
+        """Replay the graph of bucket `key` for these rows (they must fit it)."""
+        graph, static, (out_logits, out_act) = self.graphs[key]
+        for dst, src in zip(static, self.pad_to(items, key)):
+            dst.copy_(torch.from_numpy(src))
+        graph.replay()
+        self.replays += 1
+        n = len(items)
+        return out_logits[:n].cpu().numpy(), out_act[:n].cpu().numpy()   # copied out before any other replay
+
+
 @torch.no_grad()
 def _forward_once(agent, items: list[dict]):
+    runner = getattr(agent, "_graphs", None)
+    if runner is not None:
+        out = runner.run(items)
+        if out is not None:
+            return out
     tensors = [t.to(agent.device) for t in collate(items, agent.tok.pad_token_id)]
     with torch.autocast(device_type=agent.device.type, dtype=agent.dtype, enabled=agent.device.type == "cuda"):
         logits, act = agent.model(*tensors)
