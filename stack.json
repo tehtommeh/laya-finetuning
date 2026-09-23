@@ -1,0 +1,482 @@
+{
+  "_comment": "Checks run by scripts/smoke_test.py. The model-card email must come back billing on the English checkpoint; Hindi must route to multilingual; each checkpoint must be on the GPU.",
+  "services": {
+    "api": "http://localhost:8001",
+    "frontend": "http://localhost:7860"
+  },
+  "health": {
+    "api": "{api}/health",
+    "frontend": "{frontend}/"
+  },
+  "checks": [
+    {
+      "name": "api health",
+      "url": "{api}/health",
+      "expect_json_path": "status",
+      "expect_equals": "ok"
+    },
+    {
+      "name": "all three checkpoints listed",
+      "url": "{api}/v1/models",
+      "expect_json_path": "data.3.id",
+      "expect_equals": "typed-decisions"
+    },
+    {
+      "name": "gpu visible",
+      "url": "{api}/info",
+      "expect_json_path": "gpu.name"
+    },
+    {
+      "name": "every checkpoint on the gpu",
+      "url": "{api}/info",
+      "expect_json_path": "all_on_gpu",
+      "expect_equals": true
+    },
+    {
+      "name": "presets served",
+      "url": "{api}/v1/presets",
+      "expect_json_path": "guard.jailbreak.type",
+      "expect_equals": "noul"
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "model-card email -> billing",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "answers.department.choice",
+      "expect_equals": "billing"
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "model-card email routed to english",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "routing.model",
+      "expect_equals": "english"
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "score answer present",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "answers.urgency.probabilities.2"
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "noul answer present",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "answers.refund_requested.noul"
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "hindi routed to multilingual",
+      "json": {
+        "state": {
+          "body": "मुझसे दो बार शुल्क लिया गया, कृपया पैसे वापस करें।"
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "routing.model",
+      "expect_equals": "multilingual"
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "explicit typed-decisions",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        },
+        "model": "typed-decisions"
+      },
+      "expect_json_path": "routing.model",
+      "expect_equals": "typed-decisions"
+    },
+    {
+      "name": "jev-compatible alias",
+      "method": "POST",
+      "url": "{api}/v1/system_one",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "answers.churn_risk.noul"
+    },
+    {
+      "name": "route only (german sentence)",
+      "method": "POST",
+      "url": "{api}/v1/route",
+      "json": {
+        "state": "Mein Konto wurde zweimal belastet. Bitte erstatten Sie mir den Betrag, sonst kündige ich."
+      },
+      "expect_json_path": "model",
+      "expect_equals": "multilingual"
+    },
+    {
+      "name": "lang override for short input",
+      "method": "POST",
+      "url": "{api}/v1/route",
+      "json": {
+        "state": "Mein Konto wurde zweimal belastet",
+        "lang": "de"
+      },
+      "expect_json_path": "model",
+      "expect_equals": "multilingual"
+    },
+    {
+      "name": "compare across checkpoints",
+      "method": "POST",
+      "url": "{api}/v1/compare",
+      "json": {
+        "state": {
+          "from": "user@acme.com",
+          "subject": "Duplicate charge on invoice #4411",
+          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+        },
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "results.typed-decisions.answers.department.choice",
+      "timeout": 60
+    },
+    {
+      "name": "batch",
+      "method": "POST",
+      "url": "{api}/v1/decide/batch",
+      "json": {
+        "states": [
+          "I need a refund",
+          "The server is down",
+          "मुझसे दो बार शुल्क लिया गया, कृपया पैसे वापस करें।"
+        ],
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this request?",
+            "criteria": {
+              "billing": "invoices, payments, refunds",
+              "technical": "bugs, outages, system errors",
+              "sales": "pricing, new contracts",
+              "other": "everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this request?",
+            "criteria": [
+              "not urgent",
+              "soon",
+              "critical deadline or blocking issue"
+            ]
+          },
+          "churn_risk": {
+            "type": "noul",
+            "instructions": "Does the user threaten to cancel or leave?"
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the user explicitly request a refund?"
+          }
+        }
+      },
+      "expect_json_path": "results.2.routing.model",
+      "expect_equals": "multilingual",
+      "timeout": 60
+    },
+    {
+      "method": "POST",
+      "url": "{api}/v1/decide",
+      "timeout": 60,
+      "name": "bad question rejected (422)",
+      "json": {
+        "state": "x",
+        "questions": {
+          "q": {
+            "type": "choice",
+            "instructions": "?",
+            "criteria": [
+              "only-one"
+            ]
+          }
+        }
+      },
+      "expect_status": 422
+    },
+    {
+      "name": "frontend serves",
+      "url": "{frontend}/",
+      "expect_contains": "gradio"
+    },
+    {
+      "name": "frontend has showcase tabs",
+      "url": "{frontend}/config",
+      "expect_contains": "Multilingual routing"
+    }
+  ]
+}

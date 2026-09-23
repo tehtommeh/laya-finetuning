@@ -1,0 +1,53 @@
+{
+  "models": {
+    "convaiinnovations/laya": {
+      "repo": "convaiinnovations/laya",
+      "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982",
+      "revision_pinned": false,
+      "path": "models/convaiinnovations__laya",
+      "downloaded_at": "2026-09-23T01:21:38Z",
+      "file_count": 37,
+      "bytes_on_disk": 2372584543,
+      "files": {
+        "rl_agent_api.py": 4732,
+        "rl_agent_config.json": 745,
+        "model.safetensors": 842609210,
+        "README.md": 14874,
+        "rl_common.py": 19139,
+        "email_utils.py": 3937,
+        "assets/logo-lockup-dark.png": 27666,
+        "assets/logo-mark-mono.svg": 1380,
+        "assets/logo-mark.svg": 1320,
+        "assets/laya_benchmark_common.png": 278159,
+        "assets/logo-mark.png": 17962,
+        "assets/logo-lockup.svg": 1590,
+        "assets/laya_vs_jev.png": 216412,
+        "assets/logo-mark-ink.svg": 1320,
+        "assets/logo-lockup-dark.svg": 1590,
+        "assets/laya_vs_jev_full.png": 487005,
+        "assets/logo-lockup.png": 26761,
+        "assets/laya_benchmark.png": 260892,
+        "assets/logo-mark-ink.png": 17378,
+        "eval/results.md": 1608,
+        "eval/reliability_eval_zs.png": 72014,
+        "eval/benchmark_comparison.png": 467466,
+        "eval/reliability_eval_in.png": 65436,
+        "eval/results.json": 2976,
+        "tokenizer/tokenizer_config.json": 308,
+        "tokenizer/tokenizer.json": 3583228,
+        "multilingual/rl_agent_config.json": 472,
+        "multilingual/model.safetensors": 643835514,
+        "multilingual/tokenizer/tokenizer_config.json": 524,
+        "multilingual/tokenizer/tokenizer.json": 34363188,
+        "multilingual/encoder/config.json": 1938,
+        "typed-decisions/rl_agent_config.json": 847,
+        "typed-decisions/model.safetensors": 842609220,
+        "typed-decisions/tokenizer/tokenizer_config.json": 337,
+        "typed-decisions/tokenizer/tokenizer.json": 3583228,
+        "typed-decisions/encoder/config.json": 2084,
+        "encoder/config.json": 2083
+      },
+      "last_modified": "2026-09-20 01:43:36+00:00"
+    }
+  }
+}

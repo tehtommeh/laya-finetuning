@@ -1,0 +1,11 @@
+// Format sample (not enough data to train on). Lines starting with // are ignored.
+// Questions come from questions.json; each line gives the state and gold answers.
+// Shorthand: choice -> "label", score -> level int, noul -> true/false or P(true).
+{"id": "s1", "state": "I was charged twice for March, please refund one of them.", "gold": {"department": "billing", "urgency": 1, "refund_requested": true, "churn_risk": false}}
+{"id": "s2", "state": "Your API has returned 500s for an hour and our checkout is down.", "gold": {"department": "technical", "urgency": 3, "refund_requested": false, "churn_risk": 0.3}}
+{"id": "s3", "state": {"subject": "Quote for 50 seats", "body": "Could you send pricing for 50 seats with SSO?"}, "gold": {"department": "sales", "urgency": 0, "refund_requested": false, "churn_risk": false}}
+// Full form: a probability per option. Use it when annotators disagree or a teacher model was sampled.
+{"id": "s4", "state": "This is the third outage this month. Refund us or we move to a competitor.", "gold": {"department": {"probabilities": {"billing": 0.4, "technical": 0.6}}, "urgency": {"probabilities": {"2": 0.5, "3": 0.5}}, "refund_requested": true, "churn_risk": true}}
+// Leave a question out (or null) when you have no answer for it; only answered questions train.
+{"id": "s5", "state": "How do I change my profile picture?", "gold": {"department": "other", "urgency": 0, "refund_requested": null}}
+{"id": "s6", "state": "Cancel my subscription now, the product never worked.", "gold": {"department": "billing", "urgency": 2, "refund_requested": false, "churn_risk": true}}

@@ -1,0 +1,94 @@
+# FastAPI serving path: Laya is a custom encoder + decision head (not a
+# generative model), so vLLM does not apply. The official `laya` SDK runs it.
+services:
+  api:
+    build:
+      context: ./api
+      args:
+        BASE_IMAGE: ${API_BASE_IMAGE:-pytorch/pytorch:2.14.0-cuda12.6-cudnn9-runtime}
+    image: ${PROJECT_NAME:-laya-local}-api
+    container_name: ${PROJECT_NAME:-laya-local}-api
+    restart: unless-stopped
+    # Run as the invoking user; nothing here needs root.
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "${API_PORT:-8001}:8000"
+    volumes:
+      - ./models:/models:ro
+      # Fine-tuned checkpoints published by `make publish`; each subdirectory is served.
+      - ./finetuned:/finetuned:ro
+    environment:
+      MODEL_DIR: ${MODEL_DIR:-/models/convaiinnovations__laya}
+      FINETUNED_DIR: /finetuned
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-laya}
+      DEVICE: ${DEVICE:-cuda}
+      PRELOAD: ${PRELOAD:-english,multilingual,typed-decisions}
+      DEFAULT_CHECKPOINT: ${DEFAULT_CHECKPOINT:-english}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HOME: /tmp/hf
+      # README: transformers' TensorFlow probe can deadlock model construction.
+      USE_TF: "0"
+      HOME: /tmp
+    shm_size: ${SHM_SIZE:-2gb}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: ${HEALTH_START_PERIOD:-300s}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-all}
+              capabilities: [gpu]
+
+  frontend:
+    build:
+      context: ./frontend
+    image: ${PROJECT_NAME:-laya-local}-frontend
+    container_name: ${PROJECT_NAME:-laya-local}-frontend
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "${FRONTEND_PORT:-7860}:7860"
+    environment:
+      API_BASE: http://api:8000
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-laya}
+      HOME: /tmp
+      GRADIO_ANALYTICS_ENABLED: "False"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Fine-tuning. Not started by `docker compose up`; run it on demand:
+  #   docker compose run --rm train train.py --name my-run --train /data/mine/train.jsonl
+  # (the Makefile wraps the common invocations). See docs/FINETUNING.md.
+  train:
+    profiles: ["train"]
+    build:
+      context: ./train
+      args:
+        BASE_IMAGE: ${API_BASE_IMAGE:-pytorch/pytorch:2.14.0-cuda12.6-cudnn9-runtime}
+    image: ${PROJECT_NAME:-laya-local}-train
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./models:/models:ro          # base checkpoints
+      - ./data:/data                 # your datasets (prepare_example.py writes here)
+      - ./runs:/runs                 # training outputs
+      - ./finetuned:/finetuned       # publish.py copies finished models here
+      - ./train:/app:ro              # edit the scripts without rebuilding
+    environment:
+      HF_HOME: /tmp/hf
+      HOME: /tmp
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    shm_size: ${SHM_SIZE:-2gb}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${TRAIN_GPU_COUNT:-all}
+              capabilities: [gpu]

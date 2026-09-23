@@ -1,0 +1,15 @@
+# Weights are large and reproducible from download.lock.json - never commit them.
+models/*
+!models/download.lock.json
+.env
+__pycache__/
+*.pyc
+outputs/
+
+# Fine-tuning: datasets, runs and published models are local artefacts.
+data/*
+!data/sample/
+runs/*
+!runs/.gitkeep
+finetuned/*
+!finetuned/.gitkeep

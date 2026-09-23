@@ -1,0 +1,9 @@
+# Same pins as api/ so a checkpoint trained here loads identically when served.
+# Torch comes from the CUDA base image; do not add it here.
+transformers==5.17.0
+huggingface_hub==1.32.0
+safetensors==0.8.0
+numpy>=1.26
+laya==0.3.6
+# prepare_example.py only: read the typed-decisions parquet files
+pyarrow>=17

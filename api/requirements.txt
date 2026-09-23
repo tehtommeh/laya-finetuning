@@ -1,0 +1,13 @@
+# Torch is already in the CUDA base image - reinstalling it here would pull a
+# multi-gigabyte wheel and can silently replace the CUDA build with a CPU one.
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic>=2.10,<3
+# The shipped encoder configs are in the transformers v5 format
+# (rope_parameters / layer_types); 4.x cannot build ModernBERT from them.
+transformers==5.17.0
+huggingface_hub==1.32.0
+safetensors==0.8.0
+numpy>=1.26
+# Official Laya SDK: Agent, Router (script/language routing), question presets.
+laya==0.3.6
