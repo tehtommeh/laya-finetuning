@@ -101,6 +101,121 @@ curl -s localhost:8001/v1/decide -H 'content-type: application/json' -d '{
 | `GET /v1/presets` | the SDK's question sets (triage, email, guard, moderation, router) plus each fine-tune's trained questions |
 | `GET /health`, `/info`, `/v1/models` | introspection |
 
+## Question types
+
+Every question has a `type`, `instructions` and (usually) `criteria`. Laya answers all of a request's questions in
+one batched forward pass. It never generates text, so an answer is always one of the options you defined, with
+probabilities. Pick the type by the *shape* of the answer you need:
+
+| type | answer shape | you get | typical use |
+|---|---|---|---|
+| `noul` | yes / no | `noul` = P(true) | flags, guardrails, gates |
+| `choice` | exactly one of N labels | `choice`, `probabilities`, `confidence` | routing, categorisation, next action |
+| `score` | a level on an ordered scale | `score` (expected level), `probabilities` | severity, urgency, rubric marking |
+
+Measured accuracy on the typed-decisions test set (400 cases; [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md)):
+
+| type | always-most-common-label baseline | English base, zero-shot | fine-tuned (`td-full`) |
+|---|---|---|---|
+| `noul` | 0.642 | 0.488 | **0.822** |
+| `choice` | 0.418 | 0.285 | **0.718** |
+| `score` (level exactly right) | 0.335 | 0.321 | **0.676** (mean error 0.32 levels) |
+
+Zero-shot, the base checkpoint does worse than the baseline on every type. Fine-tuning is what makes these
+reliable for a specific schema (see [Fine-tuning](#fine-tuning)).
+
+### `noul`: yes / no
+
+```json
+"refund": {"type": "noul", "instructions": "Does the customer ask for money back?",
+           "criteria": {"true": "explicitly asks for a refund or chargeback", "false": "no request for money back"}}
+```
+→ `{"type": "noul", "noul": 0.90, "confidence": 0.90}`
+
+- **Output:** `noul` is P(true). `confidence` is `max(p, 1 − p)`, i.e. how far from a coin flip.
+- **`criteria` is optional.** Without it, the options are "yes, the statement holds" / "no, the statement does not
+  hold". Spelling out what counts as true and false helps with borderline cases.
+- **Good for:** flags and gates (`is_phishing`, `needs_human`, `contains_pii`), guardrails (`jailbreak`,
+  `prompt_injection`), and anything you will threshold. It is the most accurate type after fine-tuning (0.82).
+- **Thresholds:** after hard-label calibration (the default for fine-tunes), P(true) = 0.9 means right about 90%
+  of the time, so you can pick a cut-off from the precision you need. The shipped checkpoints are
+  over-confident, so don't threshold them without calibrating first.
+- **Limits:** one statement per question. "Is it urgent *and* billing-related?" is two questions. Zero-shot on
+  an unfamiliar schema it was worse than always answering the majority (0.49 vs 0.64).
+
+### `choice`: one of N labels
+
+```json
+"team": {"type": "choice", "instructions": "Which team should handle this ticket?",
+         "criteria": {"billing": "invoices, payments, refunds", "technical": "bugs, outages, errors",
+                      "sales": "pricing, quotes", "other": "none of the above"}}
+```
+→ `{"type": "choice", "choice": "billing", "probabilities": {"billing": 0.94, "technical": 0.03, ...}, "confidence": 0.78}`
+
+- **Output:** `choice` is the most likely label, and `probabilities` sums to 1 over your labels. `confidence` is
+  1 − normalised entropy (Jev-style), **not** the probability of the top label. To threshold "how sure is it
+  about this answer", use `probabilities[choice]`.
+- **`criteria`:** `{label: description}` or a plain list of labels. The descriptions are part of the input, and
+  good ones matter more than label names.
+- **Good for:** routing, categorisation, picking a next action or disposition, intent.
+- **Single-label only.** The probabilities compete, so "which of these apply?" should be one `noul` per label.
+- **Always offer an escape option** (`other`, `none of the above`). Otherwise every input is forced into one of
+  your labels, confidently.
+- **Option count:** best under ~20. All options share a 256-token budget (192 on the English base), each one cut at
+  48 tokens, so beyond ~20 the label texts get squeezed. The model card measures 0.425 on 77-option Banking77.
+  For large label sets, raise `head_max_len`, split the question into coarse and fine steps, or pre-filter with
+  the SDK's `laya.shortlist_choice` / `predict_shortlist`. The shipped temperature for 11+ options is clamped as
+  invalid, so treat confidence there as uncalibrated.
+- **Measured:** 0.72 accuracy fine-tuned. The 8-option `disposition` was the weakest choice question (0.66).
+
+### `score`: a level on an ordered scale (rubrics)
+
+```json
+"quality": {"type": "score", "instructions": "Mark the agent's reply against the rubric.",
+            "criteria": ["1 - wrong or unhelpful; ignores the question",
+                         "2 - partly answers; missing key steps",
+                         "3 - correct and complete, but unclear or impersonal",
+                         "4 - correct, complete, clear, and addresses the customer's tone"]}
+```
+→ `{"type": "score", "score": 2.4, "probabilities": {"0": 0.02, "1": 0.10, "2": 0.35, "3": 0.53}, "legend": {...}}`
+
+- **`criteria` is the rubric:** a list of level descriptions, lowest first. The model reads them when marking.
+- **Output:** `score` is the *expected* level (0-based), a decimal that can fall between levels. Add 1 for a scale
+  starting at 1 (2.4 → 3.4 above). `probabilities` shows the spread; the most likely level (here "4") can differ
+  from the rounded expectation. Use `score` for averages, rankings and dashboards, and the top level when you
+  need one discrete mark.
+- **Good for:** severity, urgency, risk, sentiment intensity, and rubric-style marking of answers, replies or
+  documents.
+- **Multi-criterion rubrics:** one `score` question per criterion (accuracy, clarity, tone…), combined with your own
+  weights. All criteria are marked in the same pass.
+- **Limits:**
+  - It is the weakest type. The model card rates ordinal `score` the weakest primitive (SST-5 0.372), and
+    fine-tuned here it had the lowest exact-level accuracy (0.68), with `urgency` at 0.61. But it is usually
+    close: mean error 0.32 levels.
+  - Keep descriptors short: levels share the same 256-token option budget, each cut at 48 tokens. 3–5 levels
+    work best, and 10+ levels with long descriptors get truncated (`make validate` reports it).
+  - Descriptors can be structured (`{"desc": ..., "example": ...}`, rendered as compact JSON), but that uses the
+    budget faster than plain text.
+- **If exact marks matter, fine-tune on marked examples** and keep the rubric wording fixed afterwards.
+
+### Behaviour shared by all types
+
+- **Input budget:** each question is encoded as `[type + instructions + options] + [state]`. The English base
+  allows 512 tokens in total with 192 for the question, which leaves roughly 320–500 for the state depending on
+  option length. Fine-tunes here use 1024 / 256. Longer states are cut from the end, so put what matters first or
+  pre-clean it (the SDK's `laya.email_state` strips quoted threads and signatures).
+- **Cost:** each question is its own sequence in the batch. Measured through the API on the 3090 (one
+  typed-decisions state): 1 question 24 ms, 5 questions 27 ms, 10 questions 41 ms. That is nearly flat up to ~5
+  questions, then ~3 ms each, so asking several questions at once is cheap.
+- **Wording is part of the model's input.** After fine-tuning, ask with the exact wording and options you trained
+  on. The UI's `<model>: <workflow>` presets load them.
+- **`action.act_probability`** (on every answer) comes from a separate "act vs escalate" head. This repo's
+  fine-tuning does not train that head, so on fine-tuned models treat it as unreliable, and on the shipped
+  checkpoints treat it as uncalibrated. For escalation decisions, prefer an explicit `noul` such as
+  `needs_human`.
+- **Nothing to parse and nothing to hallucinate,** but also no explanation. When you need a reason, ask an LLM
+  afterwards, with Laya's decision as input.
+
 ## Fine-tuning
 
 The base checkpoints are a starting point: on a real multi-workflow benchmark the English base scores *below* a
