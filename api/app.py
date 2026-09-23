@@ -38,7 +38,8 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, Union  # noqa: F401
 
 import torch
-from fastapi import FastAPI, HTTPException
+import orjson
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -61,6 +62,7 @@ BATCH_MAX_STATES = int(os.environ.get("BATCH_MAX_STATES", "1024"))
 # sequences requests get 503 instead of piling up; a request waits at most REQUEST_TIMEOUT_S.
 QUEUE_MAX_SEQUENCES = int(os.environ.get("QUEUE_MAX_SEQUENCES", "50000"))
 REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "120"))
+INLINE_ENCODE_STATES = 4   # encode this many states on the event loop; larger requests use the thread pool
 
 # checkpoint name -> subfolder inside the bundle repo (None = repo root)
 SUBFOLDERS = {"english": None, "multilingual": "multilingual", "typed-decisions": "typed-decisions"}
@@ -128,6 +130,7 @@ def load_models():
         for n in names:
             t0 = time.time()
             agent = router.load(n)
+            _precast(n, agent)
             # First call compiles/initialises CUDA kernels; do it now, not on a user's request.
             agent.system_one("warm up", WARMUP_QUESTIONS)
             if agent.device.type == "cuda":
@@ -148,6 +151,16 @@ def load_models():
             log.error("checkpoints fell back to CPU: %s", off_gpu)
     STATE["ready"] = True
     log.info("all checkpoints ready in %ss", STATE["load_seconds"])
+
+
+def _precast(name, agent):
+    """Store matmul weights in the autocast dtype once, instead of converting them on every
+    forward pass (see batching.precast_weights). Only where autocast runs, i.e. on CUDA."""
+    from batching import precast_weights
+    if agent.device.type == "cuda":
+        saved = precast_weights(agent.model, agent.dtype)
+        log.info("checkpoint %s: matmul weights stored as %s (%.2f GB saved)", name,
+                 str(agent.dtype).replace("torch.", ""), saved / 1e9)
 
 
 def _describe(agent, path, t0, t1, kind) -> dict:
@@ -188,6 +201,7 @@ def _load_finetuned():
         try:
             t0 = time.time()
             agent = Agent(_shadow_if_needed(name, src) or src, device=DEVICE)
+            _precast(name, agent)
             agent.system_one("warm up", WARMUP_QUESTIONS)
             t1 = time.time()
             agent.system_one("warm up", WARMUP_QUESTIONS)
@@ -410,7 +424,10 @@ async def _run(agent, states: list, questions: dict) -> tuple[list[dict], dict]:
     from batching import Busy, encode, postprocess
     t0 = time.perf_counter()
     try:
-        items, meta = await asyncio.to_thread(encode, agent, states, questions)
+        if len(states) <= INLINE_ENCODE_STATES:  # ~60 us each: cheaper than a thread-pool hop
+            items, meta = encode(agent, states, questions)
+        else:
+            items, meta = await asyncio.to_thread(encode, agent, states, questions)
     except ValueError as e:  # e.g. options do not fit in head_max_len
         raise HTTPException(422, str(e))
     try:
@@ -432,6 +449,12 @@ async def _run(agent, states: list, questions: dict) -> tuple[list[dict], dict]:
               "total_ms": round((time.perf_counter() - t0) * 1000, 2), "passes": ticket.passes,
               "sequences": len(items), "tokens": sum(len(it["ids"]) for it in items)}
     return results, timing
+
+
+def _json(obj) -> Response:
+    """Serialise with orjson directly. FastAPI's default path runs jsonable_encoder over the
+    whole response first (~94 us for a 3-question answer vs ~1 us)."""
+    return Response(orjson.dumps(obj), media_type="application/json")
 
 
 def _decorate(result: dict, decision, timing: dict, latency_ms: float) -> dict:
@@ -467,7 +490,7 @@ async def decide(req: DecideRequest):
     coalesced into shared GPU passes; `timing.queue_ms` is the wait for the GPU."""
     router = _router()
     qs = _questions(req.questions)
-    return await _predict(router, req.state, qs, model=_model_arg(req.model), task=req.task, lang=req.lang)
+    return _json(await _predict(router, req.state, qs, model=_model_arg(req.model), task=req.task, lang=req.lang))
 
 
 # Jev-compatible alias: the request/response shape is the same.
@@ -487,7 +510,7 @@ async def compare(req: CompareRequest):
         decision, agent = _resolve(router, req.state, qs, model=name)
         (res,), timing = await _run(agent, [req.state], qs)
         return res if "error" in res else _decorate(res, decision, timing, timing["total_ms"])
-    return {"auto_route": auto, "results": dict(zip(names, await asyncio.gather(*(one(n) for n in names))))}
+    return _json({"auto_route": auto, "results": dict(zip(names, await asyncio.gather(*(one(n) for n in names))))})
 
 
 @app.post("/v1/decide/batch")
@@ -534,5 +557,5 @@ async def decide_batch(req: BatchRequest):
         stats["groups"][name] = {"states": len(idx), "sequences": timing["sequences"], "tokens": timing["tokens"],
                                  "forward_passes": timing["passes"], "queue_ms": timing["queue_ms"]}
     total = (time.perf_counter() - t0) * 1000
-    return {"results": results, "total_ms": round(total, 1),
-            "states_per_second": round(len(results) / max(total / 1000, 1e-9), 1), "batching": stats}
+    return _json({"results": results, "total_ms": round(total, 1),
+            "states_per_second": round(len(results) / max(total / 1000, 1e-9), 1), "batching": stats})

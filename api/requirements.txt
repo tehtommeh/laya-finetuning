@@ -1,6 +1,8 @@
 # Torch is already in the CUDA base image - reinstalling it here would pull a
 # multi-gigabyte wheel and can silently replace the CUDA build with a CPU one.
 fastapi==0.141.1
+# Fast JSON responses (FastAPI's jsonable_encoder costs ~94 us per answer, orjson ~1 us).
+orjson==3.12.0
 uvicorn[standard]==0.53.0
 pydantic>=2.10,<3
 # The shipped encoder configs are in the transformers v5 format

@@ -155,7 +155,7 @@ work best.
 
 ## Combinations: several small questions, one pass
 
-Five questions cost barely more than one (24 ms for 1, 27 ms for 5, 41 ms for 10 on an RTX 3090), so decompose
+Five questions cost barely more than one (23 ms for 1, 24 ms for 5, 35 ms for 10 on an RTX 3090), so decompose
 the decision instead of cramming it into one question. Each piece stays simple and learnable, you can inspect it
 on its own, and changing policy means changing code rather than relabelling data.
 
@@ -278,15 +278,15 @@ human. Calibrated probabilities make the split trustworthy, and you choose the t
 can accept. Typically most traffic clears the gate, so the expensive path handles only the ambiguous cases.
 
 **Pre-filter for expensive calls.** A `noul` ("is this worth processing?" or "is this in scope?") in front of a
-large-model step. At ~25 ms, the check is nearly free compared with what it saves.
+large-model step. At ~22 ms, the check is nearly free compared with what it saves.
 
 **Decide, then explain.** Laya makes the decision, and an LLM writes the customer-facing explanation or reply, with
 the decision given as input. The decision stays consistent and auditable, and the LLM does what it's good at.
 
 **Real-time scoring at volume.** Score every chat message, log line, transaction or event-stream item, where an
 LLM per item would be too slow or too expensive. Batch through `/v1/decide/batch`: on the RTX 3090 that is
-~3 ms per short message (~330/s) with three questions each, 6–9× faster than one call per item. Many concurrent
-producers can also just call `/v1/decide`: the API coalesces them (~207 short requests/s at 64+ clients).
+~2.4 ms per short message (~425/s) with three questions each, 6–9× faster than one call per item. Many concurrent
+producers can also just call `/v1/decide`: the API coalesces them (~300 short requests/s at 64+ clients).
 
 **Drift and trend monitoring.** Track the mean `score` or the `choice` distribution per day. A shift (urgency
 creeping up, a new category share) is an early signal that traffic changed, before anyone reads a ticket.

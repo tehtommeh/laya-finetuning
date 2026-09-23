@@ -2,8 +2,8 @@
 
 Every inference request - a single /v1/decide, one checkpoint of /v1/compare,
 or a group of /v1/decide/batch - becomes a Ticket: its (state, question)
-sequences, encoded with the SDK's own `build_sequence`, plus a Future for the
-reply. One worker thread owns the GPU. Each round it takes queued rows for one
+sequences (identical to the SDK's `build_sequence`, with each question's part
+cached), plus a Future for the reply. One worker thread owns the GPU. Each round it takes queued rows for one
 checkpoint (up to `round_factor` x the token budget), sorts them by length and
 packs them into forward passes of at most the token budget - sorting matters:
 coalesced rows range from ~100 to 1,000 tokens and every row in a pass is padded
@@ -26,12 +26,14 @@ and the waiting request post-processes its own rows.
 
 Post-processing (`_answer`) mirrors laya.Agent.system_one line for line (same
 temperatures, rounding and output shape). If the laya pin is bumped, re-run
-scripts/test_coalescing.py and scripts/test_batch_equivalence.py.
+make test-coalescing and make test-batch. docs/PERFORMANCE.md has the
+measurements behind each design choice here.
 """
 from __future__ import annotations
 
 import collections
 import concurrent.futures
+import json
 import logging
 import os
 import threading
@@ -41,29 +43,60 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from laya.common import (QTYPES, build_sequence, collate_items, confidence_from_probs, render_options,
+from laya.common import (QTYPES, build_sequence, confidence_from_probs, render_options, serialize_state,
                          temp_bucket)
 
 log = logging.getLogger("api.batching")
 
 
 # --------------------------------------------------------------------------- encoding / post-processing
+HEAD_CACHE_MAX = 4096   # cached question encodings per checkpoint
+
+
+def _question_head(agent, iq: dict) -> tuple[list[int], list[int]]:
+    """The part of a sequence that depends only on the question: [CLS] type+instructions
+    [SEP] [MASK] opt0 [MASK] opt1 ... [SEP]. Cached per checkpoint, since callers repeat the
+    same questions. Built by laya's own build_sequence with an empty state, minus the final
+    [SEP], so a full sequence is head + state tokens + [SEP] exactly as build_sequence makes it
+    (checked by scripts/test_scheduler.py). Raises ValueError if the options do not fit."""
+    cache = agent.__dict__.setdefault("_head_cache", {})
+    key = json.dumps(iq, sort_keys=True, ensure_ascii=False)
+    hit = cache.get(key)
+    if hit is None:
+        max_len, head_max_len = agent.cfg.get("max_len", 512), agent.cfg.get("head_max_len", 192)
+        ids, markers = build_sequence(agent.tok, "", iq, max_len, head_max_len)
+        if len(markers) != len(render_options(iq)):
+            raise ValueError("options exceed head_max_len=%d" % head_max_len)
+        if len(cache) >= HEAD_CACHE_MAX:
+            cache.clear()
+        hit = cache[key] = (ids[:-1], markers)
+    return hit
+
+
 def encode(agent, states: list, questions: dict) -> tuple[list[dict], dict]:
-    """(state, question) sequences for many states, sorted by length (less padding when
-    a ticket is split across chunks). Raises ValueError, like system_one, if a
+    """(state, question) sequences for many states, sorted by length (less padding when a
+    ticket is split across passes). Identical to laya's build_sequence per pair, but each
+    question's part is cached and each state is tokenised once rather than once per question
+    (720 -> 57 us for a 3-question request). Raises ValueError, like system_one, if a
     question's options do not fit the checkpoint's head_max_len."""
     max_len = agent.cfg.get("max_len", 512)
-    head_max_len = agent.cfg.get("head_max_len", 192)
+    tok = agent.tok
     qids = list(questions)
     internal = {qid: agent._to_internal(questions[qid]) for qid in qids}
+    heads = {}
+    for qid in qids:
+        try:
+            heads[qid] = _question_head(agent, internal[qid])
+        except ValueError as e:
+            raise ValueError("question %r: %s" % (qid, e)) from None
     items = []
     for si, state in enumerate(states):
+        st = tok(serialize_state(state).replace(tok.mask_token, " "), add_special_tokens=False)["input_ids"]
         for qid in qids:
-            iq = internal[qid]
-            seq, markers = build_sequence(agent.tok, state, iq, max_len, head_max_len)
-            if len(markers) != len(render_options(iq)):
-                raise ValueError("question %r options exceed head_max_len=%d" % (qid, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[iq["t"]], "s": si, "q": qid})
+            head, markers = heads[qid]
+            room = max(0, max_len - len(head) - 1)
+            items.append({"ids": (head + st[:room] + [tok.sep_token_id])[:max_len], "markers": markers,
+                          "qtype": QTYPES[internal[qid]["t"]], "s": si, "q": qid})
     items.sort(key=lambda it: len(it["ids"]))
     return items, {"qids": qids, "internal": internal, "n_states": len(states)}
 
@@ -124,13 +157,54 @@ def _cuda_usable(device) -> bool:
         return False
 
 
+def collate(items: list[dict], pad_id: int):
+    """The tensors laya.common.collate_items builds, via numpy instead of one torch.tensor per
+    row (2.4 ms -> 0.17 ms for a 60-row pass; identical values, checked in test_scheduler.py)."""
+    n, width = len(items), max(len(it["ids"]) for it in items)
+    kmax = max(len(it["markers"]) for it in items)
+    ids = np.full((n, width), pad_id, dtype=np.int64)
+    att = np.zeros((n, width), dtype=np.int64)
+    mpos = np.zeros((n, kmax), dtype=np.int64)
+    mmask = np.zeros((n, kmax), dtype=bool)
+    for i, it in enumerate(items):
+        length, k = len(it["ids"]), len(it["markers"])
+        ids[i, :length] = it["ids"]
+        att[i, :length] = 1
+        mpos[i, :k] = it["markers"]
+        mmask[i, :k] = True
+    qtype = np.fromiter((it["qtype"] for it in items), dtype=np.int64, count=n)
+    return tuple(torch.from_numpy(x) for x in (ids, att, mpos, mmask, qtype))
+
+
+def precast_weights(model, dtype) -> int:
+    """Store matmul weights (Linear, MultiheadAttention in-projections) in the autocast dtype.
+
+    Under autocast those weights are converted from fp32 on *every* forward pass - ~400
+    extra kernel launches and 35% of a small pass's GPU time. Converting once gives the same
+    values autocast would (outputs are bit-identical), and halves those weights' memory.
+    Norms and embeddings keep their dtype, as autocast would run them. Returns bytes saved."""
+    saved = 0
+
+    def cast(t):
+        nonlocal saved
+        if t is not None and t.dtype == torch.float32:
+            saved += t.numel() * (t.element_size() - torch.empty((), dtype=dtype).element_size())
+            t.data = t.data.to(dtype)
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Linear):
+            cast(mod.weight)
+            cast(mod.bias)
+        elif isinstance(mod, torch.nn.MultiheadAttention):
+            cast(mod.in_proj_weight)
+            cast(mod.in_proj_bias)
+    return saved
+
+
 @torch.no_grad()
 def _forward_once(agent, items: list[dict]):
-    b = collate_items([items], agent.tok.pad_token_id)
+    tensors = [t.to(agent.device) for t in collate(items, agent.tok.pad_token_id)]
     with torch.autocast(device_type=agent.device.type, dtype=agent.dtype, enabled=agent.device.type == "cuda"):
-        logits, act = agent.model(b["input_ids"].to(agent.device), b["attention_mask"].to(agent.device),
-                                  b["marker_pos"].to(agent.device), b["marker_mask"].to(agent.device),
-                                  b["qtype"].to(agent.device))
+        logits, act = agent.model(*tensors)
     return logits.float().cpu().numpy(), torch.softmax(act.float(), -1).cpu().numpy()
 
 

@@ -32,7 +32,7 @@ This repo does two things:
 ### Requirements
 
 - An NVIDIA GPU with Docker GPU access (`scripts/preflight.py` checks this). Serving all three checkpoints takes
-  ~6 GB of VRAM; fine-tuning ModernBERT-large needs ~9 GB more. CPU-only works for serving (slowly), not for training.
+  ~4–5 GB of VRAM; fine-tuning ModernBERT-large needs ~9 GB more. CPU-only works for serving (slowly), not for training.
 - Docker with compose v2, ~5 GB of disk for weights, and ~10 GB for images.
 - `python3` on the host for the helper scripts (stdlib only; they bootstrap their own dependencies).
 
@@ -51,6 +51,7 @@ This repo does two things:
 | `docs/FINETUNING.md` | data format, amounts, hardware, timings, measured results |
 | `docs/USE_CASES.md` | what to build with each question type, combinations, hybrid patterns |
 | `docs/DATA_PREP.md` | turning exports, votes and LLM-teacher labels into training JSONL; splits; tested recipes |
+| `docs/PERFORMANCE.md` | every serving optimisation, the measurements behind it, and what each gained |
 
 ## Start / stop
 
@@ -133,7 +134,7 @@ thread ([`api/batching.py`](api/batching.py)) repeatedly:
 3. hands every row back to the ticket it came from. When a ticket is complete its request wakes up,
    post-processes its own rows and responds.
 
-It is opportunistic: a request arriving at an idle GPU runs immediately (unchanged ~26 ms), and requests that
+It is opportunistic: a request arriving at an idle GPU runs immediately (~22 ms), and requests that
 arrive while the GPU is busy share the next round. The event loop never blocks; tokenising and post-processing
 run in the thread pool. Responses include `timing.queue_ms` (the wait for the GPU) and `timing.gpu_passes`.
 
@@ -142,23 +143,35 @@ run in the thread pool. Responses include `timing.queue_ms` (the wait for the GP
 
 | clients | short messages: req/s (p50) | before coalescing | ~500-token states: req/s (p50) | before coalescing |
 |---|---|---|---|---|
-| 1 | 38 (26 ms) | 39 (26 ms) | 34 (29 ms) | 34 (28 ms) |
-| 4 | 72 (55 ms) | 39 (102 ms) | 38 (105 ms) | 35 (114 ms) |
-| 16 | 155 (102 ms) | 39 (407 ms) | 42 (374 ms) | 35 (455 ms) |
-| 64 | 200 (301 ms) | 39 (1,618 ms) | 48 (1,298 ms) | 35 (1,835 ms) |
-| 128 | 207 (606 ms) | 39 (3,229 ms) | 47 (2,646 ms) | 34 (3,662 ms) |
+| 1 | 44 (23 ms) | 39 (26 ms) | 40 (24 ms) | 34 (28 ms) |
+| 4 | 87 (46 ms) | 39 (102 ms) | 42 (93 ms) | 35 (114 ms) |
+| 16 | 206 (77 ms) | 39 (407 ms) | 48 (327 ms) | 35 (455 ms) |
+| 64 | 279 (215 ms) | 39 (1,618 ms) | 55 (1,124 ms) | 35 (1,835 ms) |
+| 128 | 308 (396 ms) | 39 (3,229 ms) | 55 (2,276 ms) | 34 (3,662 ms) |
 
-Short messages gain 5.3× and long states 1.4×, with no errors at any level. With short messages at high
-concurrency, the limit is now CPU rather than GPU: the API process sits at ~100% of one core (HTTP, JSON,
-tokenising, post-processing under the GIL) while the GPU idles between rounds.
+That is 7.9× for short messages and 1.6× for long states, with no errors at any level. The full history (GPU
+batching, coalescing, length-sorted rounds, the CPU-side fixes below), with the measurements behind each step,
+is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). The four CPU-side optimisations (each measured, and each output
+identical to laya's):
+
+- matmul weights stored in bf16 once at load, instead of autocast converting them on every pass (~400 kernel
+  launches per pass, and 2.4 GB of VRAM across four checkpoints)
+- question encodings cached per checkpoint, with each state tokenised once (720 → 57 µs per request)
+- pass tensors built with numpy (2.4 → 0.17 ms per 60-row pass)
+- responses serialised with orjson (94 → 1 µs)
+
+**Where the time goes now.** A forward pass costs ~21 ms of Python kernel dispatch (~950 launches) whatever its
+size. Small passes are therefore dispatch-bound: a lone request's GPU work is a few ms. Large passes are GPU-bound
+at ~45k tokens/s. CUDA graphs would remove most of the dispatch cost for small passes (measured: 22.8 → 6.7 ms
+for a 1-request pass), which is the next latency step.
 
 **One request, many states:** `/v1/decide/batch` puts all its states into the same queue, grouped by
 checkpoint. Measured against one `/v1/decide` call per state from a single client:
 
 | input size | N = 10 | N = 100 | N = 400+ | per state, batched |
 |---|---|---|---|---|
-| short messages (~110 tokens / state) | 5.9× faster | 8.1× | 8.7× | ~3 ms (~330 states/s) |
-| typed-decisions states (~500 tokens / state) | 1.2× | 1.6× | ~1.75× | ~17.5 ms (~57 states/s) |
+| short messages (~110 tokens / state) | 5.9× faster | 8.1× | 8.7× | ~2.4 ms (~425 states/s) |
+| typed-decisions states (~500 tokens / state) | 1.2× | 1.6× | ~1.75× | ~16.4 ms (~61 states/s) |
 
 A single client that loops over items gets no coalescing, so bulk work should use the batch endpoint.
 
@@ -298,7 +311,7 @@ with LLMs, and anti-patterns: [`docs/USE_CASES.md`](docs/USE_CASES.md).
   option length. Fine-tunes here use 1024 / 256. Longer states are cut from the end, so put what matters first or
   pre-clean it (the SDK's `laya.email_state` strips quoted threads and signatures).
 - **Cost:** each question is its own sequence in the batch. Measured through the API on the 3090 (one
-  typed-decisions state): 1 question 24 ms, 5 questions 27 ms, 10 questions 41 ms. That is nearly flat up to ~5
+  typed-decisions state): 1 question 23 ms, 5 questions 24 ms, 10 questions 35 ms. That is nearly flat up to ~5
   questions, then ~3 ms each, so asking several questions at once is cheap. For many states, use
   [`/v1/decide/batch`](#batching-and-coalescing); concurrent calls are coalesced automatically.
 - **Wording is part of the model's input.** After fine-tuning, ask with the exact wording and options you trained
@@ -353,14 +366,14 @@ python3 scripts/download.py --verify    # do local files match the lock?
 
 ## Measured on this host (RTX 3090 24 GB, driver 580, CUDA 12.6 image)
 
-- **VRAM:** 4.7 GB allocated by torch (5.8 GB reserved) with the three shipped checkpoints in bf16; 6.4 GB (8.0
-  reserved) with one fine-tune published as well. Batching at the default 8k-token budget adds under 1 GB of working memory.
+- **VRAM:** 4.0 GB allocated by torch (5.3 GB reserved) with the three shipped checkpoints and one published
+  fine-tune (matmul weights stored in bf16). Batching at the default 8k-token budget adds under 1 GB of working memory.
 - **Startup:** 53 s total (about 16–21 s per checkpoint, mostly encoder construction).
-- **Latency:** 17–24 ms for a single question. The model-card email with 4 questions takes ~24 ms on `english` and
-  ~20 ms on `multilingual`.
-- **Throughput:** concurrent `/v1/decide` calls reach ~207 req/s on short messages and ~48 req/s on ~500-token
-  states (coalesced; 39 and 35 without). `/v1/decide/batch` reaches ~330 states/s on short messages and ~57
-  states/s on long ones. See [Batching and coalescing](#batching-and-coalescing).
+- **Latency:** ~22 ms for a request with 3 questions on `english`, ~20 ms on `multilingual`, and 35 ms with 10
+  questions. A lone request is dominated by kernel dispatch, not GPU compute (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)).
+- **Throughput:** concurrent `/v1/decide` calls reach ~308 req/s on short messages and ~55 req/s on ~500-token
+  states (39 and 35 without coalescing). `/v1/decide/batch` reaches ~425 states/s on short messages and ~61
+  states/s on long ones. Single-request latency is ~22 ms. See [Batching and coalescing](#batching-and-coalescing).
 
 ## Things worth knowing
 

@@ -156,7 +156,7 @@ Measured on an RTX 3090 (24 GB, Ampere, bf16), with the serving API running on t
 | per run overhead | ~20 s container start + model build | same |
 | evaluation, 400 test cases | ~20 s load + ~25 s scoring per model | ~20 s load + ~10 s |
 | checkpoint on disk | 804 MB | 615 MB |
-| inference latency afterwards | unchanged (~48 ms / 5-question case) | unchanged (~25 ms) |
+| inference latency afterwards | unchanged: same architecture and cost as the base (API figures in the README) | unchanged |
 
 What that means for other hardware:
 

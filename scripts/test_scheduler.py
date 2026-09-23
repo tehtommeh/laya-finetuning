@@ -8,7 +8,8 @@ the fake forward pass returns each row's own id as its output, so any result
 landing in the wrong ticket or position is detected exactly. Covers isolation
 under heavy concurrency, grouping by checkpoint, failure bisection, OOM
 splitting, the fatal-error path, cancellation, fairness both ways, and
-backpressure.
+backpressure. Also checks the fast paths against laya itself, with the real
+tokenizers: cached encoding == build_sequence, numpy collate == collate_items.
 """
 from __future__ import annotations
 
@@ -235,6 +236,67 @@ def test_fairness():
     check("fairness: a big batch still finishes under a constant flood of singles", ok and not verify(big))
 
 
+def test_encode_and_collate_match_laya():
+    import json as _json
+    import laya
+    from laya.common import build_sequence, clamp_temperature, collate_items
+    from transformers import AutoTokenizer
+
+    class LiteAgent:
+        _to_internal = staticmethod(laya.Agent._to_internal)
+
+        def __init__(self, path):
+            self.cfg = _json.load(open(path + "/rl_agent_config.json"))
+            self.tok = AutoTokenizer.from_pretrained(path + "/tokenizer")
+
+    rnd = random.Random(3)
+    words = "refund invoice outage login crash quote seats urgent billing cancel password dashboard".split()
+    base = "/models/convaiinnovations__laya"
+    for path in (base, base + "/multilingual"):
+        ag = LiteAgent(path)
+        mism, total = 0, 0
+        for trial in range(300):
+            qs = {}
+            for j in range(rnd.randint(1, 5)):
+                t = rnd.choice(["choice", "score", "noul"])
+                ins = " ".join(rnd.choice(words) for _ in range(rnd.randint(2, 30)))
+                if t == "choice":
+                    crit = {"opt%d" % k: (" ".join(rnd.choice(words) for _ in range(rnd.randint(0, 12))) or None)
+                            for k in range(rnd.randint(2, 8))}
+                    qs["q%d" % j] = {"type": t, "instructions": ins, "criteria": crit if rnd.random() < .7 else list(crit)}
+                elif t == "score":
+                    qs["q%d" % j] = {"type": t, "instructions": ins,
+                                     "criteria": [" ".join(rnd.choice(words) for _ in range(rnd.randint(1, 6))) for _ in range(rnd.randint(2, 6))]}
+                else:
+                    qs["q%d" % j] = {"type": t, "instructions": {"text": ins} if rnd.random() < .2 else ins}
+            text = " ".join(rnd.choice(words) for _ in range(rnd.choice([3, 50, 900])))
+            if rnd.random() < .1:
+                text += " [MASK] " + text
+            state = rnd.choice([text, {"subject": text[:40], "body": text}, ["user: " + text, "agent: ok"]])
+            for attempt in range(2):                              # second pass hits the head cache
+                items, meta = batching.encode(ag, [state], qs)
+                got = {it["q"]: (it["ids"], it["markers"]) for it in items}
+                for qid, q in qs.items():
+                    want = build_sequence(ag.tok, state, ag._to_internal(q), ag.cfg["max_len"], ag.cfg["head_max_len"])
+                    total += 1
+                    mism += got[qid] != (want[0], want[1])
+            b = collate_items([items], ag.tok.pad_token_id)
+            ours = batching.collate(items, ag.tok.pad_token_id)
+            if not all(torch.equal(b[k], v) for k, v in zip(("input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"), ours)):
+                mism += 1
+        check("encode/collate: identical to laya's build_sequence and collate_items (%s, %d sequences)"
+              % (path.rsplit("/", 1)[-1], total), mism == 0, "%d mismatches" % mism)
+        for n_opts in (200, 400):   # raise exactly when laya's build_sequence drops markers
+            q = {"type": "choice", "instructions": "x", "criteria": {"o%d" % k: "word " * 40 for k in range(n_opts)}}
+            sdk_fits = len(build_sequence(ag.tok, "x", ag._to_internal(q), ag.cfg["max_len"], ag.cfg["head_max_len"])[1]) == n_opts
+            try:
+                batching.encode(ag, ["x"], {"q": q})
+                raised = False
+            except ValueError:
+                raised = True
+            check("encode: %d options -> raises=%s, same as laya (fits=%s)" % (n_opts, raised, sdk_fits), raised == (not sdk_fits))
+
+
 def test_backpressure_and_empty():
     a = FakeAgent("english")
     s = Scheduler(queue_max=100, forward_fn=make_forward())
@@ -253,7 +315,7 @@ def test_backpressure_and_empty():
 if __name__ == "__main__":
     random.seed(0)
     for fn in (test_isolation_under_concurrency, test_failure_bisection, test_oom_split, test_fatal,
-               test_cancellation, test_fairness, test_backpressure_and_empty):
+               test_cancellation, test_fairness, test_backpressure_and_empty, test_encode_and_collate_match_laya):
         fn()
     print("\n%s: %d failure(s)" % ("FAILED" if FAILS else "ALL PASSED", len(FAILS)))
     sys.exit(1 if FAILS else 0)
