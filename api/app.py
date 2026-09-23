@@ -19,6 +19,10 @@ Design notes worth preserving when you edit:
     With max_loaded=1 the SDK would rebuild a model on every language switch.
   * Inference runs in a worker thread so /health stays responsive, behind a
     lock because the SDK's GPU->CPU OOM fallback mutates the agent.
+  * /v1/decide/batch does not call system_one per state: batching.py runs
+    every (state, question) sequence in length-sorted chunks, taking the lock
+    per chunk. scripts/test_batch_equivalence.py guards it against drift from
+    the SDK's post-processing.
 """
 from __future__ import annotations
 
@@ -49,6 +53,10 @@ SHADOW_ROOT = os.environ.get("SHADOW_ROOT", "/tmp/laya-shadow")
 # Every subdirectory holding an rl_agent_config.json is served as an extra, explicitly
 # selectable checkpoint named after the directory (see train/publish.py).
 FINETUNED_DIR = os.environ.get("FINETUNED_DIR", "/finetuned")
+# /v1/decide/batch: padded tokens per forward pass. 8192 was near-best at every batch size on an
+# RTX 3090 (4k-64k measured: throughput saturates ~44k tok/s; bigger budgets only add padding and VRAM).
+BATCH_TOKEN_BUDGET = int(os.environ.get("BATCH_TOKEN_BUDGET", "8192"))
+BATCH_MAX_STATES = int(os.environ.get("BATCH_MAX_STATES", "1024"))
 
 # checkpoint name -> subfolder inside the bundle repo (None = repo root)
 SUBFOLDERS = {"english": None, "multilingual": "multilingual", "typed-decisions": "typed-decisions"}
@@ -330,7 +338,7 @@ class CompareRequest(BaseModel):
 
 
 class BatchRequest(BaseModel):
-    states: list[Union[str, dict, list]] = Field(..., min_length=1, max_length=256)
+    states: list[Union[str, dict, list]] = Field(..., min_length=1)
     questions: dict[str, Question] = Field(..., min_length=1)
     model: Checkpoint = None
 
@@ -367,15 +375,24 @@ def _ensure_loaded(name: str):
         raise HTTPException(400, "checkpoint %r is not loaded (PRELOAD=%s)" % (name, ",".join(PRELOAD)))
 
 
-def _predict(router, state, questions, **kw) -> dict:
+def _resolve(router, state, questions, **kw):
+    """(routing decision, agent) for one state."""
     if kw.get("model") in STATE["custom"]:
         decision = {"model": kw["model"], "repo": STATE["checkpoints"][kw["model"]]["path"],
                     "reason": "explicit fine-tuned checkpoint %r" % kw["model"], "detection": None, "workflow": None}
-        agent = STATE["custom"][kw["model"]]
-    else:
-        decision = router.route(state, questions, **kw)
-        _ensure_loaded(decision["model"])
-        agent = router.load(decision["model"])
+        return decision, STATE["custom"][kw["model"]]
+    decision = router.route(state, questions, **kw)
+    _ensure_loaded(decision["model"])
+    return decision, router.load(decision["model"])
+
+
+def _routing_view(decision) -> dict:
+    return {k: v for k, v in dict(decision).items() if k != "detection"} | {
+        "detection": {k: v for k, v in (decision.get("detection") or {}).items() if k != "script_profile"} or None}
+
+
+def _predict(router, state, questions, **kw) -> dict:
+    decision, agent = _resolve(router, state, questions, **kw)
     t0 = time.perf_counter()
     try:
         with LOCK:
@@ -383,8 +400,7 @@ def _predict(router, state, questions, **kw) -> dict:
     except ValueError as e:  # e.g. options do not fit in head_max_len
         raise HTTPException(422, str(e))
     res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-    res["routing"] = {k: v for k, v in dict(decision).items() if k != "detection"} | {
-        "detection": {k: v for k, v in (decision.get("detection") or {}).items() if k != "script_profile"} or None}
+    res["routing"] = _routing_view(decision)
     return res
 
 
@@ -426,14 +442,47 @@ async def compare(req: CompareRequest):
 
 @app.post("/v1/decide/batch")
 async def decide_batch(req: BatchRequest):
-    """Many states, one question set. Each state is routed independently."""
+    """Many states, one question set, truly batched on the GPU (see batching.py).
+
+    Each state is routed independently, then states are grouped by checkpoint and
+    every (state, question) sequence runs in length-sorted chunks. Results match
+    /v1/decide per state (up to bf16 rounding); `latency_ms` per result is the
+    amortised share of its checkpoint group's time.
+    """
+    from batching import decide_many
     router = _router()
+    if len(req.states) > BATCH_MAX_STATES:
+        raise HTTPException(422, "at most %d states per batch (BATCH_MAX_STATES)" % BATCH_MAX_STATES)
     qs = _questions(req.questions)
+    model = _model_arg(req.model)
 
     def run():
         t0 = time.perf_counter()
-        results = [_predict(router, s, qs, model=_model_arg(req.model)) for s in req.states]
-        return results, (time.perf_counter() - t0) * 1000
-    results, total = await asyncio.to_thread(run)
+        groups: dict[str, list[int]] = {}
+        resolved = []
+        for i, s in enumerate(req.states):
+            decision, agent = _resolve(router, s, qs, model=model)
+            resolved.append((decision, agent))
+            groups.setdefault(decision["model"], []).append(i)
+        results: list[Optional[dict]] = [None] * len(req.states)
+        stats = {"sequences": 0, "forward_passes": 0, "tokens": 0, "groups": {}}
+        for name, idx in groups.items():
+            agent = resolved[idx[0]][1]
+            tg = time.perf_counter()
+            try:
+                out, st = decide_many(agent, [req.states[i] for i in idx], qs,
+                                      token_budget=BATCH_TOKEN_BUDGET, lock=LOCK)
+            except ValueError as e:  # options do not fit in head_max_len
+                raise HTTPException(422, str(e))
+            share = (time.perf_counter() - tg) * 1000 / len(idx)
+            for i, r in zip(idx, out):
+                r["latency_ms"] = round(share, 2)
+                r["routing"] = _routing_view(resolved[i][0])
+                results[i] = r
+            for k in ("sequences", "forward_passes", "tokens"):
+                stats[k] += st[k]
+            stats["groups"][name] = {"states": len(idx), **st}
+        return results, (time.perf_counter() - t0) * 1000, stats
+    results, total, stats = await asyncio.to_thread(run)
     return {"results": results, "total_ms": round(total, 1),
-            "states_per_second": round(len(results) / max(total / 1000, 1e-9), 1)}
+            "states_per_second": round(len(results) / max(total / 1000, 1e-9), 1), "batching": stats}

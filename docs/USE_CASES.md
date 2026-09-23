@@ -284,7 +284,8 @@ large-model step. At ~25 ms, the check is nearly free compared with what it save
 the decision given as input. The decision stays consistent and auditable, and the LLM does what it's good at.
 
 **Real-time scoring at volume.** Score every chat message, log line, transaction or event-stream item, where an
-LLM per item would be too slow or too expensive. Batch through `/v1/decide/batch`.
+LLM per item would be too slow or too expensive. Batch through `/v1/decide/batch`: on the RTX 3090 that is
+~3 ms per short message (~330/s) with three questions each, 6–9× faster than one call per item.
 
 **Drift and trend monitoring.** Track the mean `score` or the `choice` distribution per day. A shift (urgency
 creeping up, a new category share) is an early signal that traffic changed, before anyone reads a ticket.

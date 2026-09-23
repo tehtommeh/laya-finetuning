@@ -406,7 +406,7 @@
       "timeout": 60
     },
     {
-      "name": "batch",
+      "name": "batch (routed per state)",
       "method": "POST",
       "url": "{api}/v1/decide/batch",
       "json": {
@@ -448,6 +448,28 @@
       "expect_json_path": "results.2.routing.model",
       "expect_equals": "multilingual",
       "timeout": 60
+    },
+    {
+      "name": "batch runs on the gpu in batches",
+      "method": "POST",
+      "url": "{api}/v1/decide/batch",
+      "timeout": 60,
+      "json": {
+        "states": [
+          "I need a refund",
+          "The server is down",
+          "Quote for 50 seats",
+          "Cancel my plan"
+        ],
+        "questions": {
+          "q": {
+            "type": "noul",
+            "instructions": "Is this about money?"
+          }
+        }
+      },
+      "expect_json_path": "batching.forward_passes",
+      "expect_equals": 1
     },
     {
       "method": "POST",

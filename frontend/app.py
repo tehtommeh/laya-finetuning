@@ -272,8 +272,10 @@ def do_batch(texts, questions_text, ckpt):
                        round(a["score"], 2) if a["type"] == "score" else round(a["noul"], 3))
         row.append(r["latency_ms"])
         rows.append(row)
-    summary = "**%d states × %d questions** in %.0f ms → **%.1f states/s** (%.1f ms/state, sequential)" % (
-        len(states), len(qs), res["total_ms"], res["states_per_second"], res["total_ms"] / len(states))
+    b = res.get("batching", {})
+    summary = "**%d states × %d questions** in %.0f ms → **%.1f states/s** (%.1f ms/state; %s sequences in %s GPU passes)" % (
+        len(states), len(qs), res["total_ms"], res["states_per_second"], res["total_ms"] / len(states),
+        b.get("sequences", "?"), b.get("forward_passes", "?"))
     return summary, gr.update(value=rows, headers=["state", "checkpoint"] + list(qs) + ["ms"])
 
 
@@ -419,7 +421,8 @@ def build():
             cmp_go.click(do_compare, [cmp_state, cmp_q], cmp_out)
 
         with gr.Tab("Batch & speed"):
-            gr.Markdown("One state per line, one question set. Shows per-state latency and throughput.")
+            gr.Markdown("One state per line, one question set. Every (state, question) pair is batched on the GPU; "
+                        "short inputs run 6-9x faster than one call per state.")
             b_texts = gr.Textbox("\n".join([
                 "My card was charged twice, I need a refund.",
                 "The API returns 500 errors since this morning's deploy.",

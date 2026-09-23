@@ -40,10 +40,10 @@ This repo does two things:
 
 | path | what |
 |---|---|
-| `api/` | FastAPI server (laya SDK `Router` + published fine-tunes) |
+| `api/` | FastAPI server: `app.py` (laya SDK `Router` + published fine-tunes), `batching.py` (true GPU batching) |
 | `frontend/` | Gradio UI |
-| `train/` | fine-tuning image: `validate.py`, `train.py`, `evaluate.py`, `publish.py`, `prepare_example.py`, `summarize.py` |
-| `scripts/` | `download.py` (weights + update check), `smoke_test.py`, `preflight.py` |
+| `train/` | fine-tuning image: `validate.py`, `train.py`, `calibrate.py`, `evaluate.py`, `publish.py`, `prepare_example.py`, `summarize.py` |
+| `scripts/` | `download.py` (weights + update check), `smoke_test.py`, `test_batch_equivalence.py`, `preflight.py`, `reproduce_experiments.sh` |
 | `models/` | downloaded base weights (read-only in containers) |
 | `data/` | your training data; `data/sample/` shows the format |
 | `runs/` | training outputs, one directory per run |
@@ -66,7 +66,7 @@ Then:
 
 ```bash
 docker compose up -d --build     # first build ~5 min; startup ~55 s (loads + warms 3 checkpoints)
-python3 scripts/smoke_test.py    # 19 checks against the live stack (make test waits for startup)
+python3 scripts/smoke_test.py    # 20 checks against the live stack (make test waits for startup)
 docker compose logs -f api
 docker compose down
 ```
@@ -99,9 +99,41 @@ curl -s localhost:8001/v1/decide -H 'content-type: application/json' -d '{
 | `POST /v1/decide` (alias `/v1/system_one`) | answer questions; optional `model` (`auto`/`english`/`multilingual`/`typed-decisions`/a published fine-tune), `lang`, `task` |
 | `POST /v1/route` | which checkpoint would answer, and why, without running the model |
 | `POST /v1/compare` | the same input on every checkpoint |
-| `POST /v1/decide/batch` | many states, one question set |
+| `POST /v1/decide/batch` | many states (up to 1,024), one question set, truly batched on the GPU; same answers as `/v1/decide` per state |
 | `GET /v1/presets` | the SDK's question sets (triage, email, guard, moderation, router) plus each fine-tune's trained questions |
-| `GET /health`, `/info`, `/v1/models` | introspection |
+| `GET /v1/preset_examples` | an example state for each fine-tune preset |
+| `GET /health`, `/info`, `/v1/models` | introspection: GPU, per-checkpoint device/latency, fine-tunes with their eval results |
+
+Errors: **422** for a malformed question (or options that do not fit the token budget), **400** for an unknown
+`model`, **503** while loading (the detail says why if loading failed).
+
+- **No authentication.** Compose publishes ports 8001 and 7860 on all interfaces, so anything on your network can
+  call the API and open the UI. For a shared machine, bind to localhost in `docker-compose.yml`
+  (`"127.0.0.1:${API_PORT:-8001}:8000"`) or put an authenticating reverse proxy in front.
+- **One GPU, one lock.** Inference is serialised, so parallel `/v1/decide` calls queue. Send many states in one
+  `/v1/decide/batch` request instead (see [Batching](#batching)).
+- **Not OpenAI-compatible.** Laya does not generate text, so there is no `/v1/chat/completions`. `/v1/system_one`
+  has the same request and response shape as TypeSafe's Jev `system_one`.
+
+### Batching
+
+`/v1/decide/batch` runs every (state, question) pair of the request through the GPU together: length-sorted, in
+chunks of at most `BATCH_TOKEN_BUDGET` padded tokens (default 8,192), with the GPU lock held per chunk so single
+requests can interleave. States are routed individually and grouped by checkpoint. A chunk that runs out of
+memory is split and retried, rather than falling back to CPU. The response adds `batching` stats (sequences,
+forward passes, tokens), and each result's `latency_ms` is its amortised share.
+
+Measured on the RTX 3090 (English base, 3 questions per state), against one `/v1/decide` call per state:
+
+| input size | N = 10 | N = 100 | N = 400+ | per state, batched |
+|---|---|---|---|---|
+| short messages (~110 tokens / state) | 5.9× faster | 8.1× | 8.7× | ~3 ms (~330 states/s) |
+| typed-decisions states (~500 tokens / state) | 1.2× | 1.6× | ~1.75× | ~17.5 ms (~57 states/s) |
+
+The GPU saturates at about 44k tokens/s. Long states already come close to that one at a time, so batching helps
+most with many short inputs. Firing parallel `/v1/decide` calls does **not** help (they queue on the GPU lock),
+so batch on the client side when you can. `scripts/test_batch_equivalence.py` (`make test-batch`) checks that
+batched answers match per-state ones (max probability difference 0.01, bf16 rounding).
 
 ## Question types
 
@@ -211,7 +243,8 @@ with LLMs, and anti-patterns: [`docs/USE_CASES.md`](docs/USE_CASES.md).
   pre-clean it (the SDK's `laya.email_state` strips quoted threads and signatures).
 - **Cost:** each question is its own sequence in the batch. Measured through the API on the 3090 (one
   typed-decisions state): 1 question 24 ms, 5 questions 27 ms, 10 questions 41 ms. That is nearly flat up to ~5
-  questions, then ~3 ms each, so asking several questions at once is cheap.
+  questions, then ~3 ms each, so asking several questions at once is cheap. For many states, use
+  [`/v1/decide/batch`](#batching).
 - **Wording is part of the model's input.** After fine-tuning, ask with the exact wording and options you trained
   on. The UI's `<model>: <workflow>` presets load them.
 - **`action.act_probability`** (on every answer) comes from a separate "act vs escalate" head. This repo's
@@ -264,9 +297,13 @@ python3 scripts/download.py --verify    # do local files match the lock?
 
 ## Measured on this host (RTX 3090 24 GB, driver 580, CUDA 12.6 image)
 
-- **VRAM:** 4.7 GB allocated by torch (5.8 GB reserved) with all three checkpoints resident, in bf16.
+- **VRAM:** 4.7 GB allocated by torch (5.8 GB reserved) with the three shipped checkpoints in bf16; 6.4 GB (8.0
+  reserved) with one fine-tune published as well. Batching at the default 8k-token budget adds under 1 GB of working memory.
 - **Startup:** 53 s total (about 16–21 s per checkpoint, mostly encoder construction).
-- **Latency:** 17–24 ms for a single question. The model-card email with 4 questions takes ~24 ms on `english`, ~20 ms on `multilingual`, and ~24 ms/state in a sequential batch.
+- **Latency:** 17–24 ms for a single question. The model-card email with 4 questions takes ~24 ms on `english` and
+  ~20 ms on `multilingual`.
+- **Throughput:** `/v1/decide/batch` reaches ~330 states/s on short messages (~3 ms/state) and ~57 states/s on
+  ~500-token states. The GPU saturates at ~44k tokens/s. See [Batching](#batching).
 
 ## Things worth knowing
 

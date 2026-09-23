@@ -1,5 +1,5 @@
 # Thin wrappers over the commands you would otherwise retype constantly.
-.PHONY: help download check verify up down logs test shell stats clean \
+.PHONY: help download check verify up down logs test test-batch shell stats clean \
         train-build example-data validate train evaluate calibrate publish learning-curve summarize experiments
 
 help:
@@ -25,6 +25,9 @@ logs:      ## Follow logs
 
 test:      ## Run the endpoint smoke tests
 	python3 scripts/smoke_test.py --wait 600
+
+test-batch:  ## Check /v1/decide/batch matches per-state /v1/decide, and time both
+	python3 scripts/test_batch_equivalence.py
 
 shell:     ## Shell into the API container
 	docker compose exec api /bin/bash

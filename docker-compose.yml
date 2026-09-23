@@ -20,6 +20,8 @@ services:
     environment:
       MODEL_DIR: ${MODEL_DIR:-/models/convaiinnovations__laya}
       FINETUNED_DIR: /finetuned
+      BATCH_TOKEN_BUDGET: ${BATCH_TOKEN_BUDGET:-8192}
+      BATCH_MAX_STATES: ${BATCH_MAX_STATES:-1024}
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-laya}
       DEVICE: ${DEVICE:-cuda}
       PRELOAD: ${PRELOAD:-english,multilingual,typed-decisions}

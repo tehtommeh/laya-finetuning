@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY *.py ./
 
 EXPOSE 8000
 # One worker only: each worker would load its own full copy of the weights.
