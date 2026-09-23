@@ -49,6 +49,8 @@ This repo does two things:
 | `runs/` | training outputs, one directory per run |
 | `finetuned/` | published fine-tunes; the API serves each subdirectory |
 | `docs/FINETUNING.md` | data format, amounts, hardware, timings, measured results |
+| `docs/USE_CASES.md` | what to build with each question type, combinations, hybrid patterns |
+| `docs/DATA_PREP.md` | turning exports, votes and LLM-teacher labels into training JSONL; splits; tested recipes |
 
 ## Start / stop
 
@@ -123,6 +125,9 @@ Measured accuracy on the typed-decisions test set (400 cases; [`docs/EXPERIMENTS
 
 Zero-shot, the base checkpoint does worse than the baseline on every type. Fine-tuning is what makes these
 reliable for a specific schema (see [Fine-tuning](#fine-tuning)).
+
+**Ideas for what to build with each type**, how to combine them, ready-to-adapt question sets, hybrid patterns
+with LLMs, and anti-patterns: [`docs/USE_CASES.md`](docs/USE_CASES.md).
 
 ### `noul`: yes / no
 
@@ -231,7 +236,8 @@ make publish  RUN=mine-v1                 # served by the API/UI as model "mine-
 
 Data is JSONL: `{"state": ..., "gold": {"question": answer}}` with a shared `questions.json`. See
 [`data/sample/`](data/sample) and the full guide, [`docs/FINETUNING.md`](docs/FINETUNING.md): what to collect,
-format, how much, hardware, timings, what comes out, and how to serve it.
+format, how much, hardware, timings, what comes out, and how to serve it. To build that JSONL from helpdesk
+exports, annotator votes or an LLM teacher, see [`docs/DATA_PREP.md`](docs/DATA_PREP.md).
 
 **Measured here** ([`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md)), on LocalLLaMA/typed-decisions (4 workflows,
 400-case test set):

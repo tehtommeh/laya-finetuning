@@ -60,7 +60,8 @@ Guidance:
 ## Data format
 
 JSON Lines, one case per line. Lines starting with `//` are ignored. A worked sample is in
-[`data/sample/`](../data/sample).
+[`data/sample/`](../data/sample). To build it from exports, annotator votes or an LLM teacher, with deduplication
+and leakage-free splits, see [DATA_PREP.md](DATA_PREP.md).
 
 ```json
 {"id": "t-001",
