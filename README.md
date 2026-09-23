@@ -43,7 +43,7 @@ This repo does two things:
 |---|---|
 | `api/` | FastAPI server: `app.py` (laya SDK `Router` + published fine-tunes), `batching.py` (GPU scheduler: batching and request coalescing) |
 | `frontend/` | Gradio UI |
-| `train/` | fine-tuning image: `validate.py`, `train.py`, `calibrate.py`, `evaluate.py`, `publish.py`, `prepare_example.py`, `summarize.py` |
+| `train/` | fine-tuning image: `validate.py`, `train.py`, `calibrate.py`, `evaluate.py`, `publish.py`, `prepare_example.py`, `summarize.py`; `bakeoff.py`, `specialists.py`, `prepare_specialists.py` for the model comparison |
 | `scripts/` | `download.py` (weights + update check), `smoke_test.py`, `test_batch_equivalence.py`, `test_scheduler.py`, `test_coalescing.py`, `load_test.py`, `preflight.py`, `reproduce_experiments.sh`; `bench/` holds the GPU/CPU micro-benchmarks behind docs/PERFORMANCE.md |
 | `models/` | downloaded base weights (read-only in containers) |
 | `data/` | your training data; `data/sample/` shows the format |
@@ -53,6 +53,7 @@ This repo does two things:
 | `docs/USE_CASES.md` | what to build with each question type, combinations, hybrid patterns |
 | `docs/DATA_PREP.md` | turning exports, votes and LLM-teacher labels into training JSONL; splits; tested recipes |
 | `docs/PERFORMANCE.md` | every serving optimisation, the measurements behind it, and what each gained |
+| `docs/BAKEOFF.md` | Laya vs popular zero-shot, fine-tuned and specialist models: does it live up to the hype? |
 
 ## Start / stop
 
@@ -353,7 +354,12 @@ exports, annotator votes or an LLM teacher, see [`docs/DATA_PREP.md`](docs/DATA_
 | accuracy | 0.360 | 0.514 | 0.591 | 0.657 | **0.735** | 0.733 |
 | train time (RTX 3090) | – | 0.4 min | 2.0 min | 3.9 min | 8.2 min | 14.0 min |
 
-Gains flatten at ~150 cases per question set. Hard-label calibration then brings ECE to 0.034. `make experiments`
+Gains flatten at ~150 cases per question set. Hard-label calibration then brings ECE to 0.034.
+
+**How it compares** ([`docs/BAKEOFF.md`](docs/BAKEOFF.md)): with 150 labelled cases Laya beats the other approaches
+tested. With ~1,000, a plain fine-tune of its own encoder (ModernBERT-large + per-question heads) wins (0.781 vs
+0.733), and it's faster to train and serve. Zero-shot, the free DeBERTa-v3-large NLI classifier beats it (0.539 vs
+0.360). `make experiments`
 reproduces every number (the dataset is fetched at a pinned revision, not stored in the repo). The published
 example model is `td-full`; check it with `python3 scripts/smoke_test.py --stack stack.finetuned.json`.
 
