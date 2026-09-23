@@ -285,7 +285,8 @@ the decision given as input. The decision stays consistent and auditable, and th
 
 **Real-time scoring at volume.** Score every chat message, log line, transaction or event-stream item, where an
 LLM per item would be too slow or too expensive. Batch through `/v1/decide/batch`: on the RTX 3090 that is
-~3 ms per short message (~330/s) with three questions each, 6–9× faster than one call per item.
+~3 ms per short message (~330/s) with three questions each, 6–9× faster than one call per item. Many concurrent
+producers can also just call `/v1/decide`: the API coalesces them (~207 short requests/s at 64+ clients).
 
 **Drift and trend monitoring.** Track the mean `score` or the `choice` distribution per day. A shift (urgency
 creeping up, a new category share) is an early signal that traffic changed, before anyone reads a ticket.

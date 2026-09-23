@@ -17,12 +17,13 @@ read-only ./models mount; nothing is fetched at runtime.
 Design notes worth preserving when you edit:
   * Checkpoints load once at startup and stay resident (Router preload).
     With max_loaded=1 the SDK would rebuild a model on every language switch.
-  * Inference runs in a worker thread so /health stays responsive, behind a
-    lock because the SDK's GPU->CPU OOM fallback mutates the agent.
-  * /v1/decide/batch does not call system_one per state: batching.py runs
-    every (state, question) sequence in length-sorted chunks, taking the lock
-    per chunk. scripts/test_batch_equivalence.py guards it against drift from
-    the SDK's post-processing.
+  * Requests never touch the GPU themselves. They encode their sequences in a
+    worker thread, queue a ticket with the scheduler in batching.py, and await
+    it. One GPU thread coalesces whatever is queued into shared forward passes,
+    so concurrent callers get batch throughput and /health stays responsive.
+    scripts/test_coalescing.py checks results never leak between requests;
+    scripts/test_batch_equivalence.py guards the post-processing against drift
+    from the SDK's system_one.
 """
 from __future__ import annotations
 
@@ -31,7 +32,6 @@ import json
 import logging
 import os
 import shutil
-import threading
 import time
 import warnings
 from contextlib import asynccontextmanager
@@ -57,12 +57,15 @@ FINETUNED_DIR = os.environ.get("FINETUNED_DIR", "/finetuned")
 # RTX 3090 (4k-64k measured: throughput saturates ~44k tok/s; bigger budgets only add padding and VRAM).
 BATCH_TOKEN_BUDGET = int(os.environ.get("BATCH_TOKEN_BUDGET", "8192"))
 BATCH_MAX_STATES = int(os.environ.get("BATCH_MAX_STATES", "1024"))
+# Coalescing scheduler (batching.py): every inference request queues here. Beyond this many queued
+# sequences requests get 503 instead of piling up; a request waits at most REQUEST_TIMEOUT_S.
+QUEUE_MAX_SEQUENCES = int(os.environ.get("QUEUE_MAX_SEQUENCES", "50000"))
+REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 
 # checkpoint name -> subfolder inside the bundle repo (None = repo root)
 SUBFOLDERS = {"english": None, "multilingual": "multilingual", "typed-decisions": "typed-decisions"}
 
 STATE: dict[str, Any] = {"ready": False, "error": None, "checkpoints": {}, "warnings": [], "custom": {}}
-LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -207,12 +210,17 @@ def _load_finetuned():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from batching import Scheduler
     try:
         load_models()
+        STATE["scheduler"] = Scheduler(token_budget=BATCH_TOKEN_BUDGET, queue_max=QUEUE_MAX_SEQUENCES)
+        STATE["scheduler"].start()
     except Exception as e:  # keep the container up so /health can report why
         STATE["error"] = "{}: {}".format(type(e).__name__, e)
         log.exception("Model failed to load")
     yield
+    if STATE.get("scheduler"):
+        STATE["scheduler"].stop()
 
 
 app = FastAPI(title="Laya decision API", lifespan=lifespan,
@@ -222,8 +230,10 @@ app = FastAPI(title="Laya decision API", lifespan=lifespan,
 def _router():
     if STATE["error"]:
         raise HTTPException(503, detail=STATE["error"])
-    if not STATE["ready"]:
+    if not STATE["ready"] or not STATE.get("scheduler"):
         raise HTTPException(503, detail="model still loading")
+    if not STATE["scheduler"].alive:
+        raise HTTPException(503, detail="GPU worker is not running")
     return STATE["router"]
 
 
@@ -260,6 +270,9 @@ def info():
         "default_checkpoint": DEFAULT_CHECKPOINT, "checkpoints": cks,
         "all_on_gpu": bool(cks) and all(c["device"] == "cuda" for c in cks.values()),
         "warnings": STATE["warnings"],
+        "scheduler": ({"alive": STATE["scheduler"].alive, "queued_sequences": STATE["scheduler"].queued(),
+                       "token_budget": BATCH_TOKEN_BUDGET, **STATE["scheduler"].stats}
+                      if STATE.get("scheduler") else None),
         "versions": {"torch": torch.__version__, "transformers": transformers.__version__, "laya": laya.__version__},
         "gpu": gpu,
     }
@@ -391,17 +404,50 @@ def _routing_view(decision) -> dict:
         "detection": {k: v for k, v in (decision.get("detection") or {}).items() if k != "script_profile"} or None}
 
 
-def _predict(router, state, questions, **kw) -> dict:
-    decision, agent = _resolve(router, state, questions, **kw)
+async def _run(agent, states: list, questions: dict) -> tuple[list[dict], dict]:
+    """Queue one ticket (all of `states` on one checkpoint) and await its results.
+    Returns (one system_one-shaped result per state, or {"error": ...}; timing)."""
+    from batching import Busy, encode, postprocess
     t0 = time.perf_counter()
     try:
-        with LOCK:
-            res = agent.system_one(state, questions)
+        items, meta = await asyncio.to_thread(encode, agent, states, questions)
     except ValueError as e:  # e.g. options do not fit in head_max_len
         raise HTTPException(422, str(e))
-    res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-    res["routing"] = _routing_view(decision)
-    return res
+    try:
+        ticket = STATE["scheduler"].submit(agent, items, meta)
+    except Busy as e:
+        raise HTTPException(503, detail="server busy: %s; retry shortly" % e)
+    except RuntimeError as e:
+        raise HTTPException(503, detail=str(e))
+    fut = asyncio.wrap_future(ticket.future)
+    try:
+        await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        ticket.dead = True
+        raise HTTPException(504, detail="timed out after %.0fs in the GPU queue" % REQUEST_TIMEOUT_S)
+    except Exception as e:  # the whole ticket failed (fatal GPU error, shutdown)
+        raise HTTPException(503, detail="%s: %s" % (type(e).__name__, e))
+    results = await asyncio.to_thread(postprocess, ticket)
+    timing = {"queue_ms": round(((ticket.t_start or ticket.t_done) - ticket.t_submit) * 1000, 2),
+              "total_ms": round((time.perf_counter() - t0) * 1000, 2), "passes": ticket.passes,
+              "sequences": len(items), "tokens": sum(len(it["ids"]) for it in items)}
+    return results, timing
+
+
+def _decorate(result: dict, decision, timing: dict, latency_ms: float) -> dict:
+    result["latency_ms"] = round(latency_ms, 2)
+    result["routing"] = _routing_view(decision)
+    result["timing"] = {"queue_ms": timing["queue_ms"], "gpu_passes": timing["passes"]}
+    return result
+
+
+async def _predict(router, state, questions, **kw) -> dict:
+    """One state, end to end. A failed state is an HTTP 500 for this request only."""
+    decision, agent = _resolve(router, state, questions, **kw)
+    (res,), timing = await _run(agent, [state], questions)
+    if "error" in res:
+        raise HTTPException(500, detail="inference failed: %s" % res["error"])
+    return _decorate(res, decision, timing, timing["total_ms"])
 
 
 @app.post("/v1/route")
@@ -417,11 +463,11 @@ def route(req: RouteRequest):
 
 @app.post("/v1/decide")
 async def decide(req: DecideRequest):
-    """Answer every question about `state` in one forward pass (Jev-style system_one)."""
+    """Answer every question about `state` (Jev-style system_one). Concurrent calls are
+    coalesced into shared GPU passes; `timing.queue_ms` is the wait for the GPU."""
     router = _router()
     qs = _questions(req.questions)
-    return await asyncio.to_thread(_predict, router, req.state, qs,
-                                   model=_model_arg(req.model), task=req.task, lang=req.lang)
+    return await _predict(router, req.state, qs, model=_model_arg(req.model), task=req.task, lang=req.lang)
 
 
 # Jev-compatible alias: the request/response shape is the same.
@@ -430,59 +476,63 @@ app.add_api_route("/v1/system_one", decide, methods=["POST"], include_in_schema=
 
 @app.post("/v1/compare")
 async def compare(req: CompareRequest):
-    """Same state and questions on every loaded checkpoint, side by side."""
+    """Same state and questions on every loaded checkpoint, side by side. A checkpoint
+    that fails gets {"error": ...}; the others still answer."""
     router = _router()
     qs = _questions(req.questions)
     auto = router.route(req.state, qs)["model"]
+    names = list(STATE["checkpoints"])
 
-    def run():
-        return {n: _predict(router, req.state, qs, model=n) for n in STATE["checkpoints"]}
-    return {"auto_route": auto, "results": await asyncio.to_thread(run)}
+    async def one(name):
+        decision, agent = _resolve(router, req.state, qs, model=name)
+        (res,), timing = await _run(agent, [req.state], qs)
+        return res if "error" in res else _decorate(res, decision, timing, timing["total_ms"])
+    return {"auto_route": auto, "results": dict(zip(names, await asyncio.gather(*(one(n) for n in names))))}
 
 
 @app.post("/v1/decide/batch")
 async def decide_batch(req: BatchRequest):
-    """Many states, one question set, truly batched on the GPU (see batching.py).
+    """Many states, one question set, batched on the GPU (see batching.py).
 
-    Each state is routed independently, then states are grouped by checkpoint and
-    every (state, question) sequence runs in length-sorted chunks. Results match
+    States are routed independently and grouped by checkpoint; each group is one
+    ticket, coalesced with any other queued work. A state that fails gets
+    {"error": ...} in its slot and the rest are unaffected. Results match
     /v1/decide per state (up to bf16 rounding); `latency_ms` per result is the
-    amortised share of its checkpoint group's time.
+    amortised share of its group's time.
     """
-    from batching import decide_many
     router = _router()
     if len(req.states) > BATCH_MAX_STATES:
         raise HTTPException(422, "at most %d states per batch (BATCH_MAX_STATES)" % BATCH_MAX_STATES)
     qs = _questions(req.questions)
     model = _model_arg(req.model)
+    t0 = time.perf_counter()
 
-    def run():
-        t0 = time.perf_counter()
+    def route_all():
         groups: dict[str, list[int]] = {}
         resolved = []
         for i, s in enumerate(req.states):
             decision, agent = _resolve(router, s, qs, model=model)
             resolved.append((decision, agent))
             groups.setdefault(decision["model"], []).append(i)
-        results: list[Optional[dict]] = [None] * len(req.states)
-        stats = {"sequences": 0, "forward_passes": 0, "tokens": 0, "groups": {}}
-        for name, idx in groups.items():
-            agent = resolved[idx[0]][1]
-            tg = time.perf_counter()
-            try:
-                out, st = decide_many(agent, [req.states[i] for i in idx], qs,
-                                      token_budget=BATCH_TOKEN_BUDGET, lock=LOCK)
-            except ValueError as e:  # options do not fit in head_max_len
-                raise HTTPException(422, str(e))
-            share = (time.perf_counter() - tg) * 1000 / len(idx)
-            for i, r in zip(idx, out):
-                r["latency_ms"] = round(share, 2)
-                r["routing"] = _routing_view(resolved[i][0])
-                results[i] = r
-            for k in ("sequences", "forward_passes", "tokens"):
-                stats[k] += st[k]
-            stats["groups"][name] = {"states": len(idx), **st}
-        return results, (time.perf_counter() - t0) * 1000, stats
-    results, total, stats = await asyncio.to_thread(run)
+        return groups, resolved
+    groups, resolved = await asyncio.to_thread(route_all)
+
+    async def run_group(idx):
+        return await _run(resolved[idx[0]][1], [req.states[i] for i in idx], qs)
+    outs = await asyncio.gather(*(run_group(idx) for idx in groups.values()))
+
+    results: list[Optional[dict]] = [None] * len(req.states)
+    stats = {"sequences": 0, "forward_passes": 0, "tokens": 0, "errors": 0, "groups": {}}
+    for (name, idx), (out, timing) in zip(groups.items(), outs):
+        share = timing["total_ms"] / len(idx)
+        for i, r in zip(idx, out):
+            results[i] = r if "error" in r else _decorate(r, resolved[i][0], timing, share)
+            stats["errors"] += "error" in r
+        stats["sequences"] += timing["sequences"]
+        stats["tokens"] += timing["tokens"]
+        stats["forward_passes"] += timing["passes"]
+        stats["groups"][name] = {"states": len(idx), "sequences": timing["sequences"], "tokens": timing["tokens"],
+                                 "forward_passes": timing["passes"], "queue_ms": timing["queue_ms"]}
+    total = (time.perf_counter() - t0) * 1000
     return {"results": results, "total_ms": round(total, 1),
             "states_per_second": round(len(results) / max(total / 1000, 1e-9), 1), "batching": stats}

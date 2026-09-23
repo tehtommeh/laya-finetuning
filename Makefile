@@ -1,5 +1,5 @@
 # Thin wrappers over the commands you would otherwise retype constantly.
-.PHONY: help download check verify up down logs test test-batch shell stats clean \
+.PHONY: help download check verify up down logs test test-batch test-coalescing load-test shell stats clean \
         train-build example-data validate train evaluate calibrate publish learning-curve summarize experiments
 
 help:
@@ -28,6 +28,13 @@ test:      ## Run the endpoint smoke tests
 
 test-batch:  ## Check /v1/decide/batch matches per-state /v1/decide, and time both
 	python3 scripts/test_batch_equivalence.py
+
+test-coalescing:  ## Scheduler unit tests + live concurrent leak test against the SDK (~3 min)
+	docker compose exec -T api python - < scripts/test_scheduler.py
+	docker compose exec -T api python - < scripts/test_coalescing.py
+
+load-test:  ## Throughput and latency under 1-128 concurrent clients
+	python3 scripts/load_test.py --clients 1 4 16 64 128
 
 shell:     ## Shell into the API container
 	docker compose exec api /bin/bash

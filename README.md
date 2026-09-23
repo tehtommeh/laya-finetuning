@@ -40,10 +40,10 @@ This repo does two things:
 
 | path | what |
 |---|---|
-| `api/` | FastAPI server: `app.py` (laya SDK `Router` + published fine-tunes), `batching.py` (true GPU batching) |
+| `api/` | FastAPI server: `app.py` (laya SDK `Router` + published fine-tunes), `batching.py` (GPU scheduler: batching and request coalescing) |
 | `frontend/` | Gradio UI |
 | `train/` | fine-tuning image: `validate.py`, `train.py`, `calibrate.py`, `evaluate.py`, `publish.py`, `prepare_example.py`, `summarize.py` |
-| `scripts/` | `download.py` (weights + update check), `smoke_test.py`, `test_batch_equivalence.py`, `preflight.py`, `reproduce_experiments.sh` |
+| `scripts/` | `download.py` (weights + update check), `smoke_test.py`, `test_batch_equivalence.py`, `test_scheduler.py`, `test_coalescing.py`, `load_test.py`, `preflight.py`, `reproduce_experiments.sh` |
 | `models/` | downloaded base weights (read-only in containers) |
 | `data/` | your training data; `data/sample/` shows the format |
 | `runs/` | training outputs, one directory per run |
@@ -105,35 +105,91 @@ curl -s localhost:8001/v1/decide -H 'content-type: application/json' -d '{
 | `GET /health`, `/info`, `/v1/models` | introspection: GPU, per-checkpoint device/latency, fine-tunes with their eval results |
 
 Errors: **422** for a malformed question (or options that do not fit the token budget), **400** for an unknown
-`model`, **503** while loading (the detail says why if loading failed).
+`model`, **503** while loading or when the GPU queue is full (`QUEUE_MAX_SEQUENCES`; retry shortly), **504** if a
+request waited longer than `REQUEST_TIMEOUT_S` (default 120 s), **500** if inference failed for that request's
+input (see [Failures](#failures)).
 
 - **No authentication.** Compose publishes ports 8001 and 7860 on all interfaces, so anything on your network can
   call the API and open the UI. For a shared machine, bind to localhost in `docker-compose.yml`
   (`"127.0.0.1:${API_PORT:-8001}:8000"`) or put an authenticating reverse proxy in front.
-- **One GPU, one lock.** Inference is serialised, so parallel `/v1/decide` calls queue. Send many states in one
-  `/v1/decide/batch` request instead (see [Batching](#batching)).
+- **Concurrent calls are coalesced.** Parallel `/v1/decide` calls share GPU passes automatically (see
+  [Batching and coalescing](#batching-and-coalescing)). A client that sends one request at a time gets no batching,
+  so bulk work should still use `/v1/decide/batch`.
 - **Not OpenAI-compatible.** Laya does not generate text, so there is no `/v1/chat/completions`. `/v1/system_one`
   has the same request and response shape as TypeSafe's Jev `system_one`.
 
-### Batching
+### Batching and coalescing
 
-`/v1/decide/batch` runs every (state, question) pair of the request through the GPU together: length-sorted, in
-chunks of at most `BATCH_TOKEN_BUDGET` padded tokens (default 8,192), with the GPU lock held per chunk so single
-requests can interleave. States are routed individually and grouped by checkpoint. A chunk that runs out of
-memory is split and retried, rather than falling back to CPU. The response adds `batching` stats (sequences,
-forward passes, tokens), and each result's `latency_ms` is its amortised share.
+Nothing touches the GPU directly. Every inference request becomes a *ticket* in one queue: a single
+`/v1/decide`, each checkpoint of a `/v1/compare`, or each checkpoint group of a `/v1/decide/batch`. The ticket
+holds the request's (state, question) sequences, already tokenised, and a future for the reply. One GPU worker
+thread ([`api/batching.py`](api/batching.py)) repeatedly:
 
-Measured on the RTX 3090 (English base, 3 questions per state), against one `/v1/decide` call per state:
+1. takes a round of queued rows for one checkpoint, up to 4 × `BATCH_TOKEN_BUDGET` tokens. The oldest ticket
+   always gets at least a quarter, so big batches progress; the rest goes to the tickets with the fewest remaining
+   rows, so single calls are not stuck behind a batch;
+2. sorts the round by length and packs it into forward passes of at most `BATCH_TOKEN_BUDGET` padded tokens
+   (default 8,192). Sorting cut padding from 43% to 13% of GPU work under mixed traffic;
+3. hands every row back to the ticket it came from. When a ticket is complete its request wakes up,
+   post-processes its own rows and responds.
+
+It is opportunistic: a request arriving at an idle GPU runs immediately (unchanged ~26 ms), and requests that
+arrive while the GPU is busy share the next round. The event loop never blocks; tokenising and post-processing
+run in the thread pool. Responses include `timing.queue_ms` (the wait for the GPU) and `timing.gpu_passes`.
+
+**Throughput** (RTX 3090, English base, 3 questions per request, `make load-test`: N clients sending
+`/v1/decide` back to back):
+
+| clients | short messages: req/s (p50) | before coalescing | ~500-token states: req/s (p50) | before coalescing |
+|---|---|---|---|---|
+| 1 | 38 (26 ms) | 39 (26 ms) | 34 (29 ms) | 34 (28 ms) |
+| 4 | 72 (55 ms) | 39 (102 ms) | 38 (105 ms) | 35 (114 ms) |
+| 16 | 155 (102 ms) | 39 (407 ms) | 42 (374 ms) | 35 (455 ms) |
+| 64 | 200 (301 ms) | 39 (1,618 ms) | 48 (1,298 ms) | 35 (1,835 ms) |
+| 128 | 207 (606 ms) | 39 (3,229 ms) | 47 (2,646 ms) | 34 (3,662 ms) |
+
+Short messages gain 5.3× and long states 1.4×, with no errors at any level. With short messages at high
+concurrency, the limit is now CPU rather than GPU: the API process sits at ~100% of one core (HTTP, JSON,
+tokenising, post-processing under the GIL) while the GPU idles between rounds.
+
+**One request, many states:** `/v1/decide/batch` puts all its states into the same queue, grouped by
+checkpoint. Measured against one `/v1/decide` call per state from a single client:
 
 | input size | N = 10 | N = 100 | N = 400+ | per state, batched |
 |---|---|---|---|---|
 | short messages (~110 tokens / state) | 5.9× faster | 8.1× | 8.7× | ~3 ms (~330 states/s) |
 | typed-decisions states (~500 tokens / state) | 1.2× | 1.6× | ~1.75× | ~17.5 ms (~57 states/s) |
 
-The GPU saturates at about 44k tokens/s. Long states already come close to that one at a time, so batching helps
-most with many short inputs. Firing parallel `/v1/decide` calls does **not** help (they queue on the GPU lock),
-so batch on the client side when you can. `scripts/test_batch_equivalence.py` (`make test-batch`) checks that
-batched answers match per-state ones (max probability difference 0.01, bf16 rounding).
+A single client that loops over items gets no coalescing, so bulk work should use the batch endpoint.
+
+**Correctness.** `make test-coalescing` runs two layers of tests:
+
+- **Scheduler unit tests** with a fake model that returns each row's own id. They cover isolation across 4,000
+  tickets from 200 threads, per-checkpoint grouping, failure bisection, OOM splitting, the fatal path,
+  cancellation, fairness both ways and backpressure.
+- **A live leak test.** 1,000 concurrent requests (decide, batch, compare and invalid, across all checkpoints, each
+  with unique question ids and labels) are checked against the SDK's own `system_one`. Keys, routing and token
+  counts must match exactly. Within a batch, each state must match its own reference better than any sibling's
+  (60,236 comparisons). Requests re-sent one at a time must match exactly (0.00000).
+
+Values under concurrency differ slightly (median 0.0006, max 0.047 in probability) because bf16 kernels round
+differently in differently padded batches. The SDK does the same on its own: one input, alone vs in a padded
+batch, moved up to 0.13 for inputs whose probability is spread across neighbouring options.
+`make test-batch` checks batch results against per-state `/v1/decide`.
+
+### Failures
+
+A failure affects only the request (or the state) that caused it:
+
+- **Bad input** is rejected before queueing: 422 / 400.
+- **A failing forward pass** (including CUDA out-of-memory) is split in half repeatedly until the failing rows are
+  isolated. Other requests that shared the pass still get their results. A single `/v1/decide` whose row fails
+  returns 500. In `/v1/decide/batch`, only the failing states get `{"error": ...}` in their slot (counted in
+  `batching.errors`). In `/v1/compare`, a failing checkpoint gets an error entry.
+- **A fatal CUDA error** (the context is unusable afterwards) fails everything queued with 503, and the process
+  exits so Docker's `restart: unless-stopped` brings the API back with a fresh GPU context.
+- **Overload:** a full queue returns 503 immediately, and a request that waits past `REQUEST_TIMEOUT_S` returns 504.
+  Its remaining rows are skipped and late results are discarded.
 
 ## Question types
 
@@ -244,7 +300,7 @@ with LLMs, and anti-patterns: [`docs/USE_CASES.md`](docs/USE_CASES.md).
 - **Cost:** each question is its own sequence in the batch. Measured through the API on the 3090 (one
   typed-decisions state): 1 question 24 ms, 5 questions 27 ms, 10 questions 41 ms. That is nearly flat up to ~5
   questions, then ~3 ms each, so asking several questions at once is cheap. For many states, use
-  [`/v1/decide/batch`](#batching).
+  [`/v1/decide/batch`](#batching-and-coalescing); concurrent calls are coalesced automatically.
 - **Wording is part of the model's input.** After fine-tuning, ask with the exact wording and options you trained
   on. The UI's `<model>: <workflow>` presets load them.
 - **`action.act_probability`** (on every answer) comes from a separate "act vs escalate" head. This repo's
@@ -302,8 +358,9 @@ python3 scripts/download.py --verify    # do local files match the lock?
 - **Startup:** 53 s total (about 16–21 s per checkpoint, mostly encoder construction).
 - **Latency:** 17–24 ms for a single question. The model-card email with 4 questions takes ~24 ms on `english` and
   ~20 ms on `multilingual`.
-- **Throughput:** `/v1/decide/batch` reaches ~330 states/s on short messages (~3 ms/state) and ~57 states/s on
-  ~500-token states. The GPU saturates at ~44k tokens/s. See [Batching](#batching).
+- **Throughput:** concurrent `/v1/decide` calls reach ~207 req/s on short messages and ~48 req/s on ~500-token
+  states (coalesced; 39 and 35 without). `/v1/decide/batch` reaches ~330 states/s on short messages and ~57
+  states/s on long ones. See [Batching and coalescing](#batching-and-coalescing).
 
 ## Things worth knowing
 
